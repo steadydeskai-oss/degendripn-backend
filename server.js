@@ -54,15 +54,17 @@ function proxyImageUrl(url) {
 
 // Fetch, compute and cache everything needed for a product's print area:
 // catalog IDs, print dimensions, placement name, and template overlay coords.
-async function getProductPrintInfo(productKey, pfHeaders, color) {
-  const cacheKey = color ? `${productKey}:${color}` : productKey;
+async function getProductPrintInfo(productKey, pfHeaders, color, size) {
+  const cacheKey = `${productKey}:${color || ''}:${size || ''}`;
   if (printAreaInfoCache.has(cacheKey)) return printAreaInfoCache.get(cacheKey);
 
   let syncVariantId;
   if (color) {
     const variantMap = buildVariantMap()[productKey] || {};
-    const match = Object.entries(variantMap).find(([k]) => k.split('|')[1] === color);
-    syncVariantId = match?.[1] || REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
+    // Try exact size|color match first, then any color match
+    const exactMatch = size ? Object.entries(variantMap).find(([k]) => k === `${size}|${color}`) : null;
+    const colorMatch = Object.entries(variantMap).find(([k]) => k.split('|')[1] === color);
+    syncVariantId = exactMatch?.[1] ?? colorMatch?.[1] ?? REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
   } else {
     syncVariantId = REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
   }
@@ -139,7 +141,7 @@ async function getProductPrintInfo(productKey, pfHeaders, color) {
     };
   }
 
-  console.log(`[PrintInfo] ${cacheKey}: template.imageUrl=${template.imageUrl || 'null'} catalogPhotoUrl=${catalogPhotoUrl || 'null'} variantPreviewUrl=${variantPreviewUrl || 'null'}`);
+  console.log(`[PrintInfo] ${productKey}${color?`:${color}`:''}${size?`:${size}`:''}: template.imageUrl=${template.imageUrl || 'null'} catalogPhotoUrl=${catalogPhotoUrl || 'null'}`);
 
   const info = { catalogProductId, catalogVariantId, placementName, area_width, area_height, template, catalogPhotoUrl, variantPreviewUrl };
   printAreaInfoCache.set(cacheKey, info);
@@ -390,11 +392,11 @@ app.post('/api/upload-design', async (req, res) => {
 
 // ─── MOCKUP GENERATION ────────────────────────────────────────────────────────
 // POST /api/mockup
-// Body: { productKey, imageUrl, color, position: { xPct, yPct, wPct, hPct } }
+// Body: { productKey, imageUrl, color, size, position: { xPct, yPct, wPct, hPct } }
 //   xPct/yPct = top-left corner as fraction of print area (0–1)
 //   wPct/hPct = logo size as fraction of print area (0–1)
 app.post('/api/mockup', async (req, res) => {
-  const { productKey, imageUrl, position, color } = req.body;
+  const { productKey, imageUrl, position, color, size } = req.body;
   if (!productKey || !imageUrl)
     return res.status(400).json({ error: 'Missing productKey or imageUrl' });
   if (!process.env.PRINTFUL_API_KEY)
@@ -403,7 +405,7 @@ app.post('/api/mockup', async (req, res) => {
   // Default: logo centered at 50% width
   const pos = position || { xPct: 0.25, yPct: 0.25, wPct: 0.50, hPct: 0.50 };
   const sig = [pos.xPct, pos.yPct, pos.wPct, pos.hPct].map(v => Math.round(v * 1000)).join('_');
-  const cacheKey = `v2:${productKey}:${color || 'default'}:${imageUrl}:${sig}`;
+  const cacheKey = `v2:${productKey}:${color || ''}:${size || ''}:${imageUrl}:${sig}`;
 
   if (mockupCache.has(cacheKey))
     return res.json({ mockupUrl: mockupCache.get(cacheKey) });
@@ -415,7 +417,7 @@ app.post('/api/mockup', async (req, res) => {
 
   try {
     const { catalogProductId, catalogVariantId, placementName, area_width, area_height }
-      = await getProductPrintInfo(productKey, pfHeaders, color);
+      = await getProductPrintInfo(productKey, pfHeaders, color, size);
 
     // Convert fractions → pixels, clamped strictly inside print area
     const imgW = Math.max(1, Math.min(area_width,  Math.round(area_width  * pos.wPct)));
@@ -445,7 +447,16 @@ app.post('/api/mockup', async (req, res) => {
     const taskData = await taskRes.json();
     console.log(`[Mockup] ${productKey} — create-task HTTP ${taskRes.status}:`, JSON.stringify(taskData));
 
-    if (!taskRes.ok) throw new Error(`Mockup task failed: ${taskData.error?.message || JSON.stringify(taskData)}`);
+    if (!taskRes.ok) {
+      const errMsg = taskData.error?.message || JSON.stringify(taskData);
+      const retryMatch = errMsg.match(/try again after (\d+) seconds?/i);
+      if (retryMatch || taskRes.status === 429) {
+        const retryAfter = retryMatch ? parseInt(retryMatch[1]) : 60;
+        console.warn(`[Mockup] ${productKey} — rate limited, retry after ${retryAfter}s`);
+        return res.status(429).json({ error: errMsg, retryAfter });
+      }
+      throw new Error(`Mockup task failed: ${errMsg}`);
+    }
 
     const taskKey = taskData.result.task_key;
     console.log(`[Mockup] ${productKey} — task_key: ${taskKey}, polling...`);
