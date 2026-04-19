@@ -234,7 +234,7 @@ function getVariantId(pid, size, color) {
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cors({ origin: true, credentials: true }));
 app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
