@@ -67,6 +67,10 @@ async function getProductPrintInfo(productKey, pfHeaders) {
 
   const catalogVariantId = svData.result.sync_variant.variant_id;
   const catalogProductId = svData.result.sync_variant.product.product_id;
+  const svFiles = svData.result.sync_variant.files ?? [];
+  const variantPreviewUrl = svFiles.find(f => f.type === 'preview')?.preview_url
+                         ?? svFiles[0]?.preview_url
+                         ?? null;
 
   // Get printfile dimensions (the actual print area in pixels)
   const pfRes  = await fetch(`https://api.printful.com/mockup-generator/printfiles/${catalogProductId}`, { headers: pfHeaders });
@@ -127,7 +131,9 @@ async function getProductPrintInfo(productKey, pfHeaders) {
     };
   }
 
-  const info = { catalogProductId, catalogVariantId, placementName, area_width, area_height, template, catalogPhotoUrl };
+  console.log(`[PrintInfo] ${productKey}: template.imageUrl=${template.imageUrl || 'null'} catalogPhotoUrl=${catalogPhotoUrl || 'null'} variantPreviewUrl=${variantPreviewUrl || 'null'}`);
+
+  const info = { catalogProductId, catalogVariantId, placementName, area_width, area_height, template, catalogPhotoUrl, variantPreviewUrl };
   printAreaInfoCache.set(productKey, info);
   return info;
 }
