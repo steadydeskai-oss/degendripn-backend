@@ -14,7 +14,9 @@ const PORT = process.env.PORT || 3001;
 const MOCKUP_CACHE_FILE = path.join(__dirname, 'mockup-cache.json');
 let _cacheData = {};
 try { _cacheData = JSON.parse(fs.readFileSync(MOCKUP_CACHE_FILE, 'utf8')); } catch {}
-const mockupCache = new Map(Object.entries(_cacheData));
+const mockupCache = new Map(
+  Object.entries(_cacheData).filter(([k]) => !k.startsWith('v2:mug:'))
+);
 
 function saveMockupCache() {
   const obj = {};
@@ -476,7 +478,18 @@ app.post('/api/mockup', async (req, res) => {
       const pollData = await pollRes.json();
       const status = pollData.result?.status;
       console.log(`[Mockup] ${productKey} — poll ${i+1}: status=${status}`);
-      if (status === 'completed') { mockupUrl = pollData.result.mockups?.[0]?.mockup_url; break; }
+      if (status === 'completed') {
+        const primary = pollData.result.mockups?.[0];
+        if (productKey === 'mug' && primary?.extra?.length > 0) {
+          console.log(`[Mockup] mug extra views:`, JSON.stringify(primary.extra.map(e => ({ title: e.title, option: e.option, option_group: e.option_group }))));
+          const front = primary.extra.find(e => /front/i.test(e.title || '') || /front/i.test(e.option || ''));
+          mockupUrl = front?.url ?? primary.mockup_url;
+          console.log(`[Mockup] mug — selected ${front ? `extra "${front.title}"` : 'primary (no front extra found)'}: ${mockupUrl}`);
+        } else {
+          mockupUrl = primary?.mockup_url;
+        }
+        break;
+      }
       if (status === 'failed') {
         console.error(`[Mockup] ${productKey} — poll failed response:`, JSON.stringify(pollData));
         throw new Error('Printful mockup generation failed');
