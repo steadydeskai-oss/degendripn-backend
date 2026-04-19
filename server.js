@@ -54,11 +54,19 @@ function proxyImageUrl(url) {
 
 // Fetch, compute and cache everything needed for a product's print area:
 // catalog IDs, print dimensions, placement name, and template overlay coords.
-async function getProductPrintInfo(productKey, pfHeaders) {
-  if (printAreaInfoCache.has(productKey)) return printAreaInfoCache.get(productKey);
+async function getProductPrintInfo(productKey, pfHeaders, color) {
+  const cacheKey = color ? `${productKey}:${color}` : productKey;
+  if (printAreaInfoCache.has(cacheKey)) return printAreaInfoCache.get(cacheKey);
 
-  const syncVariantId = REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
-  if (!syncVariantId) throw new Error(`No sync variant configured for: ${productKey}`);
+  let syncVariantId;
+  if (color) {
+    const variantMap = buildVariantMap()[productKey] || {};
+    const match = Object.entries(variantMap).find(([k]) => k.split('|')[1] === color);
+    syncVariantId = match?.[1] || REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
+  } else {
+    syncVariantId = REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
+  }
+  if (!syncVariantId) throw new Error(`No sync variant configured for: ${productKey}${color ? ` (${color})` : ''}`);
 
   // Resolve catalog variant + product IDs
   const svRes  = await fetch(`https://api.printful.com/sync/variant/${syncVariantId}`, { headers: pfHeaders });
@@ -131,10 +139,10 @@ async function getProductPrintInfo(productKey, pfHeaders) {
     };
   }
 
-  console.log(`[PrintInfo] ${productKey}: template.imageUrl=${template.imageUrl || 'null'} catalogPhotoUrl=${catalogPhotoUrl || 'null'} variantPreviewUrl=${variantPreviewUrl || 'null'}`);
+  console.log(`[PrintInfo] ${cacheKey}: template.imageUrl=${template.imageUrl || 'null'} catalogPhotoUrl=${catalogPhotoUrl || 'null'} variantPreviewUrl=${variantPreviewUrl || 'null'}`);
 
   const info = { catalogProductId, catalogVariantId, placementName, area_width, area_height, template, catalogPhotoUrl, variantPreviewUrl };
-  printAreaInfoCache.set(productKey, info);
+  printAreaInfoCache.set(cacheKey, info);
   return info;
 }
 
@@ -275,6 +283,7 @@ app.get('/api/color', async (req, res) => {
 // Returns catalog IDs, print dimensions, placement name, and template overlay data.
 app.get('/api/printarea/:productKey', async (req, res) => {
   const { productKey } = req.params;
+  const color = req.query.color || null;
   if (!REPRESENTATIVE_SYNC_VARIANTS[productKey])
     return res.status(404).json({ error: 'Unknown product key' });
   if (!process.env.PRINTFUL_API_KEY)
@@ -285,10 +294,10 @@ app.get('/api/printarea/:productKey', async (req, res) => {
     'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
   };
   try {
-    const info = await getProductPrintInfo(productKey, pfHeaders);
+    const info = await getProductPrintInfo(productKey, pfHeaders, color);
     res.json(info);
   } catch (err) {
-    console.error(`Print area error [${productKey}]:`, err.message);
+    console.error(`Print area error [${productKey}${color ? `:${color}` : ''}]:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -381,11 +390,11 @@ app.post('/api/upload-design', async (req, res) => {
 
 // ─── MOCKUP GENERATION ────────────────────────────────────────────────────────
 // POST /api/mockup
-// Body: { productKey, imageUrl, position: { xPct, yPct, wPct, hPct } }
+// Body: { productKey, imageUrl, color, position: { xPct, yPct, wPct, hPct } }
 //   xPct/yPct = top-left corner as fraction of print area (0–1)
 //   wPct/hPct = logo size as fraction of print area (0–1)
 app.post('/api/mockup', async (req, res) => {
-  const { productKey, imageUrl, position } = req.body;
+  const { productKey, imageUrl, position, color } = req.body;
   if (!productKey || !imageUrl)
     return res.status(400).json({ error: 'Missing productKey or imageUrl' });
   if (!process.env.PRINTFUL_API_KEY)
@@ -394,7 +403,7 @@ app.post('/api/mockup', async (req, res) => {
   // Default: logo centered at 50% width
   const pos = position || { xPct: 0.25, yPct: 0.25, wPct: 0.50, hPct: 0.50 };
   const sig = [pos.xPct, pos.yPct, pos.wPct, pos.hPct].map(v => Math.round(v * 1000)).join('_');
-  const cacheKey = `v2:${productKey}:${imageUrl}:${sig}`;
+  const cacheKey = `v2:${productKey}:${color || 'default'}:${imageUrl}:${sig}`;
 
   if (mockupCache.has(cacheKey))
     return res.json({ mockupUrl: mockupCache.get(cacheKey) });
@@ -406,7 +415,7 @@ app.post('/api/mockup', async (req, res) => {
 
   try {
     const { catalogProductId, catalogVariantId, placementName, area_width, area_height }
-      = await getProductPrintInfo(productKey, pfHeaders);
+      = await getProductPrintInfo(productKey, pfHeaders, color);
 
     // Convert fractions → pixels, clamped strictly inside print area
     const imgW = Math.max(1, Math.min(area_width,  Math.round(area_width  * pos.wPct)));
