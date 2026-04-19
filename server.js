@@ -580,7 +580,7 @@ async function createPrintfulOrder(stripeSession) {
 }
 
 // ─── START ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 DegenDrip backend  http://localhost:${PORT}`);
   console.log(`   Print area:  GET  /api/printarea/:productKey`);
   console.log(`   Mockup:      POST /api/mockup`);
