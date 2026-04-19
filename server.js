@@ -358,9 +358,13 @@ app.post('/api/upload-design', async (req, res) => {
     tempImageStore.set(uuid, { buffer, created: Date.now() });
     console.log(`[upload-design] Stored ${(buffer.length / 1024).toFixed(0)} KB as uuid=${uuid}`);
 
-    const backendUrl = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+    // Auto-detect Railway public URL so BACKEND_URL doesn't need to be set manually
+    const backendUrl = (
+      process.env.BACKEND_URL ||
+      (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
+    ).replace(/\/$/, '');
     if (!backendUrl) {
-      console.warn('[upload-design] BACKEND_URL not set — cannot make image public for Printful');
+      console.warn('[upload-design] BACKEND_URL not set and RAILWAY_PUBLIC_DOMAIN not available — cannot make image public for Printful');
       return res.json({ designUrl: null });
     }
 
