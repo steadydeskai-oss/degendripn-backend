@@ -1,0 +1,590 @@
+require('dotenv').config();
+const express = require('express');
+const cors    = require('cors');
+const Jimp    = require('jimp');
+const fetch   = require('node-fetch');
+const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const fs      = require('fs');
+const path    = require('path');
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+
+// ─── Disk-backed mockup cache ─────────────────────────────────────────────────
+const MOCKUP_CACHE_FILE = path.join(__dirname, 'mockup-cache.json');
+let _cacheData = {};
+try { _cacheData = JSON.parse(fs.readFileSync(MOCKUP_CACHE_FILE, 'utf8')); } catch {}
+const mockupCache = new Map(Object.entries(_cacheData));
+
+function saveMockupCache() {
+  const obj = {};
+  for (const [k, v] of mockupCache) obj[k] = v;
+  try { fs.writeFileSync(MOCKUP_CACHE_FILE, JSON.stringify(obj)); } catch {}
+}
+
+// ─── Print area info cache (productKey → full info including template) ────────
+const printAreaInfoCache = new Map();
+
+// ─── Catalog product photo cache (catalogProductId → imageUrl) ────────────────
+const catalogPhotoCache = new Map();
+
+async function getCatalogProductPhoto(catalogProductId, pfHeaders) {
+  if (catalogPhotoCache.has(catalogProductId)) return catalogPhotoCache.get(catalogProductId);
+  try {
+    const res  = await fetch(`https://api.printful.com/products/${catalogProductId}`, { headers: pfHeaders });
+    const data = await res.json();
+    const url  = data.result?.product?.image || null;
+    if (url) catalogPhotoCache.set(catalogProductId, url);
+    return url;
+  } catch { return null; }
+}
+
+// Wrap an image URL through wsrv.nl so Printful can fetch it (follows redirects, converts WebP→PNG).
+// If already a wsrv.nl URL, extract the inner source URL and re-wrap with our standard params so
+// the final URL is always properly encoded (raw wsrv.nl URLs from the frontend aren't encoded).
+function proxyImageUrl(url) {
+  if (url.startsWith('https://wsrv.nl/') || url.startsWith('http://wsrv.nl/')) {
+    try {
+      const src = new URL(url).searchParams.get('url');
+      if (src) return `https://wsrv.nl/?url=${encodeURIComponent(src)}&output=png&w=1800`;
+    } catch {}
+  }
+  return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=png&w=1800`;
+}
+
+// Fetch, compute and cache everything needed for a product's print area:
+// catalog IDs, print dimensions, placement name, and template overlay coords.
+async function getProductPrintInfo(productKey, pfHeaders) {
+  if (printAreaInfoCache.has(productKey)) return printAreaInfoCache.get(productKey);
+
+  const syncVariantId = REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
+  if (!syncVariantId) throw new Error(`No sync variant configured for: ${productKey}`);
+
+  // Resolve catalog variant + product IDs
+  const svRes  = await fetch(`https://api.printful.com/sync/variant/${syncVariantId}`, { headers: pfHeaders });
+  const svData = await svRes.json();
+  if (!svRes.ok) throw new Error(`Sync variant lookup failed: ${svData.error?.message}`);
+
+  const catalogVariantId = svData.result.sync_variant.variant_id;
+  const catalogProductId = svData.result.sync_variant.product.product_id;
+
+  // Get printfile dimensions (the actual print area in pixels)
+  const pfRes  = await fetch(`https://api.printful.com/mockup-generator/printfiles/${catalogProductId}`, { headers: pfHeaders });
+  const pfData = await pfRes.json();
+
+  const variantPf = pfData.result?.variant_printfiles?.[0]?.placements ?? {};
+  let placementName = 'front';
+  if (!variantPf.front) {
+    if (variantPf.front_large) placementName = 'front_large';
+    else if (Object.keys(variantPf).length > 0) placementName = Object.keys(variantPf)[0];
+  }
+  const pfId     = variantPf[placementName];
+  const printfile = pfData.result?.printfiles?.find(p => p.printfile_id === pfId)
+                 ?? pfData.result?.printfiles?.[0];
+  const area_width  = printfile?.width  ?? 1800;
+  const area_height = printfile?.height ?? 2400;
+
+  // Get template overlay coordinates (where the print area sits on the product photo)
+  let template = null;
+  try {
+    const tmRes  = await fetch(`https://api.printful.com/mockup-generator/templates/${catalogProductId}`, { headers: pfHeaders });
+    const tmData = await tmRes.json();
+
+    // Find the template for our variant; fall back to first available
+    const variantMapping = tmData.result?.variant_mapping ?? [];
+    const variantMap     = variantMapping.find(v => v.variant_id === catalogVariantId);
+    const templateId     = variantMap?.templates?.[0]?.template_id
+                        ?? tmData.result?.templates?.[0]?.template_id;
+    const tmpl           = tmData.result?.templates?.find(t => t.template_id === templateId)
+                        ?? tmData.result?.templates?.[0];
+
+    if (tmpl) {
+      template = {
+        imageUrl:        tmpl.image_url,
+        templateWidth:   tmpl.template_width,
+        templateHeight:  tmpl.template_height,
+        printAreaTop:    tmpl.print_area_top,
+        printAreaLeft:   tmpl.print_area_left,
+        printAreaWidth:  tmpl.print_area_width,
+        printAreaHeight: tmpl.print_area_height,
+      };
+    }
+  } catch {}
+
+  // Always fetch catalog product photo — used as canvas background (cleaner than template overlay images)
+  const catalogPhotoUrl = await getCatalogProductPhoto(catalogProductId, pfHeaders);
+
+  // If template API returned nothing usable, synthesize a full-area template from the catalog photo
+  if (!template || !template.imageUrl) {
+    template = {
+      imageUrl:        catalogPhotoUrl || '',
+      templateWidth:   area_width,
+      templateHeight:  area_height,
+      printAreaTop:    0,
+      printAreaLeft:   0,
+      printAreaWidth:  area_width,
+      printAreaHeight: area_height,
+    };
+  }
+
+  const info = { catalogProductId, catalogVariantId, placementName, area_width, area_height, template, catalogPhotoUrl };
+  printAreaInfoCache.set(productKey, info);
+  return info;
+}
+
+// Representative sync variant per product — used for mockup catalog ID resolution.
+const REPRESENTATIVE_SYNC_VARIANTS = {
+  tshirt:              () => process.env.PRINTFUL_TSHIRT_WHITE_M,
+  hoodie:              () => process.env.PRINTFUL_HOODIE_WHITE_M,
+  sweatpants:          () => process.env.PRINTFUL_SWEATPANTS_BLACK_M,
+  snapback:            () => process.env.PRINTFUL_SNAPBACK_WHITE,
+  stickers:            () => process.env.PRINTFUL_STICKERS_3X3,
+  mug:                 () => process.env.PRINTFUL_MUG,
+  waterbottle:         () => process.env.PRINTFUL_BOTTLE_WHITE,
+  tote:                () => process.env.PRINTFUL_TOTE_BLACK,
+  pins:                () => process.env.PRINTFUL_PINS_2_25,
+  'phonecase-iphone':  () => process.env.PRINTFUL_IPHONECASE_IP15,
+  'phonecase-samsung': () => process.env.PRINTFUL_SAMSUNGCASE_S24,
+};
+
+// ─── Variant lookup ───────────────────────────────────────────────────────────
+function buildVariantMap() {
+  const e = process.env;
+  return {
+    tshirt: {
+      'S|Black Heather':   e.PRINTFUL_TSHIRT_BLACK_HEATHER_S,
+      'M|Black Heather':   e.PRINTFUL_TSHIRT_BLACK_HEATHER_M,
+      'L|Black Heather':   e.PRINTFUL_TSHIRT_BLACK_HEATHER_L,
+      'XL|Black Heather':  e.PRINTFUL_TSHIRT_BLACK_HEATHER_XL,
+      '2XL|Black Heather': e.PRINTFUL_TSHIRT_BLACK_HEATHER_2XL,
+      'S|White':           e.PRINTFUL_TSHIRT_WHITE_S,
+      'M|White':           e.PRINTFUL_TSHIRT_WHITE_M,
+      'L|White':           e.PRINTFUL_TSHIRT_WHITE_L,
+      'XL|White':          e.PRINTFUL_TSHIRT_WHITE_XL,
+      '2XL|White':         e.PRINTFUL_TSHIRT_WHITE_2XL,
+    },
+    hoodie: {
+      'S|Black':   e.PRINTFUL_HOODIE_BLACK_S,   'M|Black':   e.PRINTFUL_HOODIE_BLACK_M,
+      'L|Black':   e.PRINTFUL_HOODIE_BLACK_L,   'XL|Black':  e.PRINTFUL_HOODIE_BLACK_XL,
+      '2XL|Black': e.PRINTFUL_HOODIE_BLACK_2XL,
+      'S|White':   e.PRINTFUL_HOODIE_WHITE_S,   'M|White':   e.PRINTFUL_HOODIE_WHITE_M,
+      'L|White':   e.PRINTFUL_HOODIE_WHITE_L,   'XL|White':  e.PRINTFUL_HOODIE_WHITE_XL,
+      '2XL|White': e.PRINTFUL_HOODIE_WHITE_2XL,
+    },
+    sweatpants: {
+      'S|Black':              e.PRINTFUL_SWEATPANTS_BLACK_S,
+      'M|Black':              e.PRINTFUL_SWEATPANTS_BLACK_M,
+      'L|Black':              e.PRINTFUL_SWEATPANTS_BLACK_L,
+      'XL|Black':             e.PRINTFUL_SWEATPANTS_BLACK_XL,
+      '2XL|Black':            e.PRINTFUL_SWEATPANTS_BLACK_2XL,
+      '3XL|Black':            e.PRINTFUL_SWEATPANTS_BLACK_3XL,
+      'S|Athletic Heather':   e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_S,
+      'M|Athletic Heather':   e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_M,
+      'L|Athletic Heather':   e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_L,
+      'XL|Athletic Heather':  e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_XL,
+      '2XL|Athletic Heather': e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_2XL,
+      '3XL|Athletic Heather': e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_3XL,
+    },
+    snapback:     { 'One Size|Dark Navy': e.PRINTFUL_SNAPBACK_DARK_NAVY, 'One Size|White': e.PRINTFUL_SNAPBACK_WHITE },
+    stickers:     { '3×3 inch': e.PRINTFUL_STICKERS_3X3, '4×4 inch': e.PRINTFUL_STICKERS_4X4, '5.5×5.5 inch': e.PRINTFUL_STICKERS_55X55 },
+    mug:          { 'One Size': e.PRINTFUL_MUG },
+    waterbottle:  { 'One Size|Black': e.PRINTFUL_BOTTLE_BLACK, 'One Size|White': e.PRINTFUL_BOTTLE_WHITE },
+    tote:         { 'One Size|Black': e.PRINTFUL_TOTE_BLACK, 'One Size|Oyster': e.PRINTFUL_TOTE_OYSTER },
+    pins:         { '1.25 inch': e.PRINTFUL_PINS_1_25, '2.25 inch': e.PRINTFUL_PINS_2_25 },
+    'phonecase-iphone': {
+      'iPhone 11': e.PRINTFUL_IPHONECASE_IP11, 'iPhone 11 Pro': e.PRINTFUL_IPHONECASE_IP11_PRO,
+      'iPhone 11 Pro Max': e.PRINTFUL_IPHONECASE_IP11_PRO_MAX, 'iPhone 12 Mini': e.PRINTFUL_IPHONECASE_IP12_MINI,
+      'iPhone 12': e.PRINTFUL_IPHONECASE_IP12, 'iPhone 12 Pro': e.PRINTFUL_IPHONECASE_IP12_PRO,
+      'iPhone 12 Pro Max': e.PRINTFUL_IPHONECASE_IP12_PRO_MAX, 'iPhone 13 Mini': e.PRINTFUL_IPHONECASE_IP13_MINI,
+      'iPhone 13': e.PRINTFUL_IPHONECASE_IP13, 'iPhone 13 Pro': e.PRINTFUL_IPHONECASE_IP13_PRO,
+      'iPhone 13 Pro Max': e.PRINTFUL_IPHONECASE_IP13_PRO_MAX, 'iPhone 14': e.PRINTFUL_IPHONECASE_IP14,
+      'iPhone 14 Plus': e.PRINTFUL_IPHONECASE_IP14_PLUS, 'iPhone 14 Pro': e.PRINTFUL_IPHONECASE_IP14_PRO,
+      'iPhone 14 Pro Max': e.PRINTFUL_IPHONECASE_IP14_PRO_MAX, 'iPhone 15': e.PRINTFUL_IPHONECASE_IP15,
+      'iPhone 15 Plus': e.PRINTFUL_IPHONECASE_IP15_PLUS, 'iPhone 15 Pro': e.PRINTFUL_IPHONECASE_IP15_PRO,
+      'iPhone 15 Pro Max': e.PRINTFUL_IPHONECASE_IP15_PRO_MAX, 'iPhone 16': e.PRINTFUL_IPHONECASE_IP16,
+      'iPhone 16 Plus': e.PRINTFUL_IPHONECASE_IP16_PLUS, 'iPhone 16 Pro': e.PRINTFUL_IPHONECASE_IP16_PRO,
+      'iPhone 16 Pro Max': e.PRINTFUL_IPHONECASE_IP16_PRO_MAX, 'iPhone 17': e.PRINTFUL_IPHONECASE_IP17,
+      'iPhone 17 Air': e.PRINTFUL_IPHONECASE_IP17_AIR, 'iPhone 17 Pro': e.PRINTFUL_IPHONECASE_IP17_PRO,
+      'iPhone 17 Pro Max': e.PRINTFUL_IPHONECASE_IP17_PRO_MAX,
+    },
+    'phonecase-samsung': {
+      'Samsung Galaxy S10': e.PRINTFUL_SAMSUNGCASE_S10, 'Samsung Galaxy S10e': e.PRINTFUL_SAMSUNGCASE_S10E,
+      'Samsung Galaxy S10 Plus': e.PRINTFUL_SAMSUNGCASE_S10_PLUS,
+      'Samsung Galaxy S20': e.PRINTFUL_SAMSUNGCASE_S20, 'Samsung Galaxy S20 FE': e.PRINTFUL_SAMSUNGCASE_S20_FE,
+      'Samsung Galaxy S20 Plus': e.PRINTFUL_SAMSUNGCASE_S20_PLUS, 'Samsung Galaxy S20 Ultra': e.PRINTFUL_SAMSUNGCASE_S20_ULTRA,
+      'Samsung Galaxy S21': e.PRINTFUL_SAMSUNGCASE_S21, 'Samsung Galaxy S21 Plus': e.PRINTFUL_SAMSUNGCASE_S21_PLUS,
+      'Samsung Galaxy S21 Ultra': e.PRINTFUL_SAMSUNGCASE_S21_ULTRA, 'Samsung Galaxy S21 FE': e.PRINTFUL_SAMSUNGCASE_S21_FE,
+      'Samsung Galaxy S22': e.PRINTFUL_SAMSUNGCASE_S22, 'Samsung Galaxy S22 Plus': e.PRINTFUL_SAMSUNGCASE_S22_PLUS,
+      'Samsung Galaxy S22 Ultra': e.PRINTFUL_SAMSUNGCASE_S22_ULTRA,
+      'Samsung Galaxy S23': e.PRINTFUL_SAMSUNGCASE_S23, 'Samsung Galaxy S23 Plus': e.PRINTFUL_SAMSUNGCASE_S23_PLUS,
+      'Samsung Galaxy S23 Ultra': e.PRINTFUL_SAMSUNGCASE_S23_ULTRA,
+      'Samsung Galaxy S24': e.PRINTFUL_SAMSUNGCASE_S24, 'Samsung Galaxy S24 Plus': e.PRINTFUL_SAMSUNGCASE_S24_PLUS,
+      'Samsung Galaxy S24 Ultra': e.PRINTFUL_SAMSUNGCASE_S24_ULTRA,
+      'Samsung Galaxy S25': e.PRINTFUL_SAMSUNGCASE_S25, 'Samsung Galaxy S25 Plus': e.PRINTFUL_SAMSUNGCASE_S25_PLUS,
+      'Samsung Galaxy S25 Ultra': e.PRINTFUL_SAMSUNGCASE_S25_ULTRA,
+    },
+  };
+}
+
+function getVariantId(pid, size, color) {
+  const m = buildVariantMap()[pid];
+  if (!m) return null;
+  if (color) return m[`${size}|${color}`] ?? m[size] ?? null;
+  return m[size] ?? null;
+}
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
+app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use('/api/webhook', express.raw({ type: 'application/json' }));
+app.use(express.json());
+
+// ─── Frontend ─────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.sendFile(path.resolve(__dirname, '../DegenDrip_v14.html')));
+
+// ─── Health ───────────────────────────────────────────────────────────────────
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ─── COLOR DETECTION ─────────────────────────────────────────────────────────
+app.get('/api/color', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'Missing url param' });
+  try {
+    const image = await Jimp.read(url);
+    const w = image.getWidth() - 1, h = image.getHeight() - 1;
+    const corners = [
+      Jimp.intToRGBA(image.getPixelColor(0, 0)), Jimp.intToRGBA(image.getPixelColor(w, 0)),
+      Jimp.intToRGBA(image.getPixelColor(0, h)), Jimp.intToRGBA(image.getPixelColor(w, h)),
+    ].filter(c => c.a > 20);
+    if (!corners.length) return res.json({ color: '#ffffff' });
+    const r = Math.round(corners.reduce((s,c) => s+c.r, 0) / corners.length);
+    const g = Math.round(corners.reduce((s,c) => s+c.g, 0) / corners.length);
+    const b = Math.round(corners.reduce((s,c) => s+c.b, 0) / corners.length);
+    res.json({ color: '#' + [r,g,b].map(x => x.toString(16).padStart(2,'0')).join('') });
+  } catch (err) {
+    res.json({ color: '#ffffff' });
+  }
+});
+
+// ─── PRINT AREA INFO ──────────────────────────────────────────────────────────
+// Returns catalog IDs, print dimensions, placement name, and template overlay data.
+app.get('/api/printarea/:productKey', async (req, res) => {
+  const { productKey } = req.params;
+  if (!REPRESENTATIVE_SYNC_VARIANTS[productKey])
+    return res.status(404).json({ error: 'Unknown product key' });
+  if (!process.env.PRINTFUL_API_KEY)
+    return res.status(503).json({ error: 'Printful API key not configured' });
+
+  const pfHeaders = {
+    'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
+  };
+  try {
+    const info = await getProductPrintInfo(productKey, pfHeaders);
+    res.json(info);
+  } catch (err) {
+    console.error(`Print area error [${productKey}]:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── CATALOG PRODUCT PHOTO ───────────────────────────────────────────────────
+app.get('/api/productphoto/:catalogProductId', async (req, res) => {
+  const id = parseInt(req.params.catalogProductId, 10);
+  if (!id) return res.status(400).json({ error: 'Invalid catalog product ID' });
+  if (!process.env.PRINTFUL_API_KEY)
+    return res.status(503).json({ error: 'Printful API key not configured' });
+
+  const pfHeaders = {
+    'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
+  };
+  try {
+    const url = await getCatalogProductPhoto(id, pfHeaders);
+    if (!url) return res.status(404).json({ error: 'No photo found' });
+    res.json({ imageUrl: url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── TEMP IMAGE STORE ────────────────────────────────────────────────────────
+// Holds composited design PNGs in memory for Printful to fetch during mockup generation.
+const tempImageStore = new Map(); // uuid → { buffer, created }
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [uuid, entry] of tempImageStore)
+    if (entry.created < cutoff) tempImageStore.delete(uuid);
+}, 60_000);
+
+// Serve a temporarily stored image (Printful fetches this during file upload)
+app.get('/api/tmp/:uuid', (req, res) => {
+  const entry = tempImageStore.get(req.params.uuid);
+  if (!entry) return res.status(404).send('Not found');
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.send(entry.buffer);
+});
+
+// POST /api/upload-design
+// Body: { base64: "data:image/png;base64,..." }
+// Stores the image, gives Printful a URL to fetch it, returns a Printful CDN URL.
+// Requires BACKEND_URL env var so Printful can reach /api/tmp/:uuid.
+app.post('/api/upload-design', async (req, res) => {
+  const { base64 } = req.body;
+  if (!base64) return res.status(400).json({ error: 'Missing base64' });
+
+  try {
+    const b64 = base64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(b64, 'base64');
+    const { randomBytes } = require('crypto');
+    const uuid = randomBytes(16).toString('hex');
+    tempImageStore.set(uuid, { buffer, created: Date.now() });
+    console.log(`[upload-design] Stored ${(buffer.length / 1024).toFixed(0)} KB as uuid=${uuid}`);
+
+    const backendUrl = (process.env.BACKEND_URL || '').replace(/\/$/, '');
+    if (!backendUrl) {
+      console.warn('[upload-design] BACKEND_URL not set — cannot make image public for Printful');
+      return res.json({ designUrl: null });
+    }
+
+    const tempUrl = `${backendUrl}/api/tmp/${uuid}`;
+
+    if (!process.env.PRINTFUL_API_KEY) return res.json({ designUrl: tempUrl });
+
+    // Upload to Printful file library → permanent CDN URL
+    const pfHeaders = {
+      'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
+      'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
+      'Content-Type':   'application/json',
+    };
+    const uploadRes  = await fetch('https://api.printful.com/files', {
+      method:  'POST',
+      headers: pfHeaders,
+      body:    JSON.stringify({ type: 'default', url: tempUrl, filename: `design_${uuid}.png` }),
+    });
+    const uploadData = await uploadRes.json();
+    console.log(`[upload-design] Printful /files HTTP ${uploadRes.status}:`, JSON.stringify(uploadData));
+
+    const designUrl = uploadData.result?.url || tempUrl;
+    res.json({ designUrl });
+  } catch (err) {
+    console.error('[upload-design] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── MOCKUP GENERATION ────────────────────────────────────────────────────────
+// POST /api/mockup
+// Body: { productKey, imageUrl, position: { xPct, yPct, wPct, hPct } }
+//   xPct/yPct = top-left corner as fraction of print area (0–1)
+//   wPct/hPct = logo size as fraction of print area (0–1)
+app.post('/api/mockup', async (req, res) => {
+  const { productKey, imageUrl, position } = req.body;
+  if (!productKey || !imageUrl)
+    return res.status(400).json({ error: 'Missing productKey or imageUrl' });
+  if (!process.env.PRINTFUL_API_KEY)
+    return res.status(503).json({ error: 'Printful API key not configured' });
+
+  // Default: logo centered at 50% width
+  const pos = position || { xPct: 0.25, yPct: 0.25, wPct: 0.50, hPct: 0.50 };
+  const sig = [pos.xPct, pos.yPct, pos.wPct, pos.hPct].map(v => Math.round(v * 1000)).join('_');
+  const cacheKey = `v2:${productKey}:${imageUrl}:${sig}`;
+
+  if (mockupCache.has(cacheKey))
+    return res.json({ mockupUrl: mockupCache.get(cacheKey) });
+
+  const pfHeaders = {
+    'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
+  };
+
+  try {
+    const { catalogProductId, catalogVariantId, placementName, area_width, area_height }
+      = await getProductPrintInfo(productKey, pfHeaders);
+
+    // Convert fractions → pixels, clamped strictly inside print area
+    const imgW = Math.max(1, Math.min(area_width,  Math.round(area_width  * pos.wPct)));
+    const imgH = Math.max(1, Math.min(area_height, Math.round(area_height * pos.hPct)));
+    const left = Math.max(0, Math.min(area_width  - imgW, Math.round(area_width  * pos.xPct)));
+    const top  = Math.max(0, Math.min(area_height - imgH, Math.round(area_height * pos.yPct)));
+
+    const pfPosition = { area_width, area_height, width: imgW, height: imgH, top, left };
+    const proxied = proxyImageUrl(imageUrl);
+
+    console.log(`\n[Mockup] ${productKey} — create-task request:`);
+    console.log(`  catalogProductId: ${catalogProductId}  variantId: ${catalogVariantId}  placement: ${placementName}`);
+    console.log(`  print area: ${area_width}×${area_height}  logo: ${imgW}×${imgH} at (${left},${top})`);
+    console.log(`  image_url: ${proxied}`);
+
+    const taskBody = {
+      variant_ids: [catalogVariantId],
+      files:       [{ placement: placementName, image_url: proxied, position: pfPosition }],
+      format:      'jpg',
+    };
+
+    const taskRes  = await fetch(`https://api.printful.com/mockup-generator/create-task/${catalogProductId}`, {
+      method:  'POST',
+      headers: { ...pfHeaders, 'Content-Type': 'application/json' },
+      body:    JSON.stringify(taskBody),
+    });
+    const taskData = await taskRes.json();
+    console.log(`[Mockup] ${productKey} — create-task HTTP ${taskRes.status}:`, JSON.stringify(taskData));
+
+    if (!taskRes.ok) throw new Error(`Mockup task failed: ${taskData.error?.message || JSON.stringify(taskData)}`);
+
+    const taskKey = taskData.result.task_key;
+    console.log(`[Mockup] ${productKey} — task_key: ${taskKey}, polling...`);
+    let mockupUrl = null;
+
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const pollRes  = await fetch(
+        `https://api.printful.com/mockup-generator/task?task_key=${encodeURIComponent(taskKey)}`,
+        { headers: pfHeaders },
+      );
+      const pollData = await pollRes.json();
+      const status = pollData.result?.status;
+      console.log(`[Mockup] ${productKey} — poll ${i+1}: status=${status}`);
+      if (status === 'completed') { mockupUrl = pollData.result.mockups?.[0]?.mockup_url; break; }
+      if (status === 'failed') {
+        console.error(`[Mockup] ${productKey} — poll failed response:`, JSON.stringify(pollData));
+        throw new Error('Printful mockup generation failed');
+      }
+    }
+
+    if (!mockupUrl) throw new Error('Mockup generation timed out');
+
+    mockupCache.set(cacheKey, mockupUrl);
+    saveMockupCache();
+    console.log(`📸 Mockup cached [${productKey}]: ${mockupUrl}`);
+    res.json({ mockupUrl });
+  } catch (err) {
+    console.error(`[Mockup] ${productKey} — ERROR: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── STRIPE CHECKOUT ──────────────────────────────────────────────────────────
+app.post('/api/checkout', async (req, res) => {
+  const { cart, shipping, tokenName, tokenSym } = req.body;
+  if (!cart || cart.length === 0) return res.status(400).json({ error: 'Empty cart' });
+  try {
+    const lineItems = cart.map(item => ({
+      price_data: {
+        currency: 'usd',
+        product_data: {
+          name: `${item.name} — $${tokenSym} ${tokenName}`,
+          description: `Size: ${item.size}${item.color ? ` / ${item.color}` : ''}`,
+        },
+        unit_amount: Math.round(item.price * 100),
+      },
+      quantity: item.qty,
+    }));
+    lineItems.push({ price_data: { currency:'usd', product_data:{name:'Shipping & handling'}, unit_amount:499 }, quantity:1 });
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items:  lineItems,
+      mode:        'payment',
+      success_url: `${process.env.FRONTEND_URL}?order=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${process.env.FRONTEND_URL}?order=cancelled`,
+      customer_email: shipping.email,
+      metadata: {
+        cart:       JSON.stringify(cart),
+        shipping:   JSON.stringify(shipping),
+        token_name: tokenName,
+        token_sym:  tokenSym,
+      },
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── STRIPE WEBHOOK ───────────────────────────────────────────────────────────
+app.post('/api/webhook', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    createPrintfulOrder(session).catch(err => console.error('Printful order failed:', err.message));
+  }
+  res.json({ received: true });
+});
+
+// ─── PRINTFUL ORDER ───────────────────────────────────────────────────────────
+async function createPrintfulOrder(stripeSession) {
+  const cart     = JSON.parse(stripeSession.metadata.cart);
+  const shipping = JSON.parse(stripeSession.metadata.shipping);
+
+  const pfHeaders = {
+    'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
+  };
+
+  const items = await Promise.all(cart.map(async item => {
+    const variantId = getVariantId(item.pid, item.size, item.color);
+    if (!variantId) throw new Error(`No variant ID for ${item.pid}/${item.size}/${item.color}`);
+
+    // Build Printful position from saved percentage-based logo position
+    let filePosition;
+    if (item.logoPos && item.designUrl) {
+      try {
+        const { area_width, area_height } = await getProductPrintInfo(item.pid, pfHeaders);
+        const pos  = item.logoPos;
+        const imgW = Math.max(1, Math.min(area_width,  Math.round(area_width  * pos.wPct)));
+        const imgH = Math.max(1, Math.min(area_height, Math.round(area_height * pos.hPct)));
+        const left = Math.max(0, Math.min(area_width  - imgW, Math.round(area_width  * pos.xPct)));
+        const top  = Math.max(0, Math.min(area_height - imgH, Math.round(area_height * pos.yPct)));
+        filePosition = { area_width, area_height, width: imgW, height: imgH, top, left };
+      } catch {}
+    }
+
+    const fileObj = { type: 'default', url: proxyImageUrl(item.designUrl || '') };
+    if (filePosition) fileObj.position = filePosition;
+
+    return { sync_variant_id: parseInt(variantId), quantity: item.qty, files: [fileObj] };
+  }));
+
+  const order = {
+    recipient: {
+      name:         `${shipping.fn} ${shipping.ln}`,
+      address1:     shipping.addr1,
+      address2:     shipping.addr2 || '',
+      city:         shipping.city,
+      state_code:   shipping.state,
+      country_code: shipping.country,
+      zip:          shipping.zip,
+      email:        shipping.email,
+    },
+    items,
+    retail_costs: { shipping: '4.99' },
+  };
+
+  const response = await fetch('https://api.printful.com/orders', {
+    method:  'POST',
+    headers: { ...pfHeaders, 'Content-Type': 'application/json' },
+    body:    JSON.stringify(order),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(`Printful error: ${JSON.stringify(result)}`);
+  console.log(`✅ Printful order #${result.result?.id} for ${shipping.email}`);
+  return result;
+}
+
+// ─── START ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`\n🚀 DegenDrip backend  http://localhost:${PORT}`);
+  console.log(`   Print area:  GET  /api/printarea/:productKey`);
+  console.log(`   Mockup:      POST /api/mockup`);
+  console.log(`   Upload:      POST /api/upload-design  (BACKEND_URL=${process.env.BACKEND_URL || 'not set — crop upload disabled'})`);
+  console.log(`   Checkout:    POST /api/checkout`);
+  console.log(`   Mockup cache: ${mockupCache.size} entries\n`);
+});

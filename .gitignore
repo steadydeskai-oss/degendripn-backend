@@ -1,0 +1,4 @@
+node_modules/
+.env
+mockup-cache.json
+tmp/
