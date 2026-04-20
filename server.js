@@ -204,7 +204,7 @@ function buildVariantMap() {
       '3XL|Athletic Heather': e.PRINTFUL_SWEATPANTS_ATHLETIC_HEATHER_3XL,
     },
     snapback:     { 'One Size|Dark Navy': e.PRINTFUL_SNAPBACK_DARK_NAVY, 'One Size|White': e.PRINTFUL_SNAPBACK_WHITE },
-    stickers:     { '3×3 inch': e.PRINTFUL_STICKERS_3X3, '4×4 inch': e.PRINTFUL_STICKERS_4X4, '5.5×5.5 inch': e.PRINTFUL_STICKERS_55X55 },
+    stickers:     { '3×3 inch': e.PRINTFUL_STICKERS_3X3, '4×4 inch': e.PRINTFUL_STICKERS_4X4, '5.5×5.5 inch': e.PRINTFUL_STICKERS_55X55, '15×3.75 inch': e.PRINTFUL_STICKERS_15X375 },
     mug:          { 'One Size': e.PRINTFUL_MUG },
     waterbottle:  { 'One Size|Black': e.PRINTFUL_BOTTLE_BLACK, 'One Size|White': e.PRINTFUL_BOTTLE_WHITE },
     tote:         { 'One Size|Black': e.PRINTFUL_TOTE_BLACK, 'One Size|Oyster': e.PRINTFUL_TOTE_OYSTER },
