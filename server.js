@@ -6,23 +6,60 @@ const fetch   = require('node-fetch');
 const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fs      = require('fs');
 const path    = require('path');
+const Redis   = require('ioredis');
 const { checkText, checkCart } = require('./moderation');
+
+// ─── Redis client ─────────────────────────────────────────────────────────────
+const redis = process.env.REDIS_URL
+  ? new Redis(process.env.REDIS_URL, { lazyConnect: false, maxRetriesPerRequest: 2 })
+  : null;
+if (redis) {
+  redis.on('connect', () => console.log('Redis connected'));
+  redis.on('error',   e  => console.error('Redis error:', e.message));
+} else {
+  console.warn('[redis] REDIS_URL not set — order data will use in-memory fallback');
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── Order data store ─────────────────────────────────────────────────────────
-// Holds full cart + shipping between /api/checkout (session creation) and the
-// Stripe webhook (fulfillment). In-memory is fine — both happen on the same
-// process within seconds to minutes. 24-hour TTL cleans up uncompleted sessions.
-// Upgrade to Redis if you need multi-instance or restart resilience.
+// ─── Order data store (Redis) ─────────────────────────────────────────────────
+// Persists full cart + shipping between /api/checkout and the Stripe webhook.
+// Uses Redis with a 24-hour TTL. Falls back to in-memory Map when REDIS_URL is
+// not set (dev) or when Redis is temporarily unavailable (graceful degradation).
 const { randomBytes } = require('crypto');
-const orderStore = new Map(); // orderId → { cart, shipping, tokenName, tokenSym, shippingCost, moderationFlags, createdAt }
-setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [id, entry] of orderStore)
-    if (Date.parse(entry.createdAt) < cutoff) orderStore.delete(id);
-}, 60 * 60 * 1000);
+const orderStoreFallback = new Map(); // used only when Redis is unavailable
+
+async function orderStoreSet(orderId, data) {
+  const json = JSON.stringify(data);
+  if (redis) {
+    try { await redis.setex(`order:${orderId}`, 86400, json); return; } catch (e) {
+      console.error('[orderStore] Redis setex failed, using fallback:', e.message);
+    }
+  }
+  orderStoreFallback.set(orderId, data);
+}
+
+async function orderStoreGet(orderId) {
+  if (redis) {
+    try {
+      const raw = await redis.get(`order:${orderId}`);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      console.error('[orderStore] Redis get failed, checking fallback:', e.message);
+    }
+  }
+  return orderStoreFallback.get(orderId) || null;
+}
+
+async function orderStoreDel(orderId) {
+  if (redis) {
+    try { await redis.del(`order:${orderId}`); } catch (e) {
+      console.error('[orderStore] Redis del failed:', e.message);
+    }
+  }
+  orderStoreFallback.delete(orderId);
+}
 
 // ─── Pending orders store ──────────────────────────────────────────────────────
 // Orders held for content review (soft-block). Persisted to JSON file so they
@@ -864,12 +901,12 @@ app.post('/api/checkout', async (req, res) => {
       });
     }
 
-    // Store full order data in memory — webhook fetches it by orderId.
+    // Store full order data in Redis (TTL 24h) — webhook fetches by orderId.
     // This keeps Stripe metadata well under the 500-char-per-value limit.
     const orderId = `order_${randomBytes(8).toString('hex')}`;
     // Strip thumbnailUrl (large data URL) — not needed for fulfillment
     const cartForStore = cart.map(({ thumbnailUrl: _t, ...rest }) => rest);
-    orderStore.set(orderId, {
+    await orderStoreSet(orderId, {
       cart:            cartForStore,
       shipping,
       tokenName:       tokenName || '',
@@ -921,8 +958,8 @@ app.post('/api/webhook', async (req, res) => {
 async function handleCompletedSession(session) {
   const orderId = session.metadata?.order_id;
 
-  // Fetch full order data from in-memory store; fall back to legacy metadata format
-  let orderData = orderId ? orderStore.get(orderId) : null;
+  // Fetch full order data from Redis; fall back to legacy metadata format
+  let orderData = orderId ? await orderStoreGet(orderId) : null;
   if (!orderData) {
     // Backwards-compat: sessions created before this change stored cart in metadata
     console.warn('[webhook] orderStore miss for', orderId, '— falling back to metadata');
@@ -950,7 +987,7 @@ async function handleCompletedSession(session) {
       stripe.refunds.create({ payment_intent: session.payment_intent })
         .catch(e => console.error('[webhook] Refund failed:', e.message));
     }
-    if (orderId) orderStore.delete(orderId);
+    if (orderId) await orderStoreDel(orderId);
     return;
   }
 
@@ -972,7 +1009,7 @@ async function handleCompletedSession(session) {
     };
     pendingOrders.set(pendingId, order);
     savePendingOrders();
-    if (orderId) orderStore.delete(orderId);
+    if (orderId) await orderStoreDel(orderId);
     console.warn(`[webhook] Order HELD — ${pendingId} — ${shipping.email} — flags: ${reviewFlags.map(f => `"${f.text}"`).join(', ')}`);
     return;
   }
@@ -980,7 +1017,7 @@ async function handleCompletedSession(session) {
   // Clean order — send to Printful
   await createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippingCost,
     stripeSessionId: session.id, stripePaymentIntent: session.payment_intent });
-  if (orderId) orderStore.delete(orderId);
+  if (orderId) await orderStoreDel(orderId);
 }
 });
 
