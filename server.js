@@ -263,6 +263,54 @@ app.get('/', (req, res) => res.sendFile(path.resolve(__dirname, '../DegenDrip_v1
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
+// ─── Stock status ─────────────────────────────────────────────────────────────
+const stockCache = new Map(); // productKey -> { data, expiresAt }
+const STOCK_CACHE_TTL = 5 * 60 * 1000;
+
+app.get('/api/stock/:productKey', async (req, res) => {
+  const { productKey } = req.params;
+  const cached = stockCache.get(productKey);
+  if (cached && Date.now() < cached.expiresAt) return res.json(cached.data);
+
+  const pfHeaders = { Authorization: `Bearer ${process.env.PRINTFUL_API_KEY}` };
+  try {
+    const repVariantId = REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
+    if (!repVariantId) return res.status(404).json({ error: 'Unknown product' });
+
+    const repRes  = await fetch(`https://api.printful.com/sync/variant/${repVariantId}`, { headers: pfHeaders });
+    const repData = await repRes.json();
+    const syncProductId = repData.result?.sync_variant?.sync_product_id;
+    if (!syncProductId) return res.status(500).json({ error: 'Could not resolve sync product' });
+
+    const prodRes  = await fetch(`https://api.printful.com/sync/product/${syncProductId}`, { headers: pfHeaders });
+    const prodData = await prodRes.json();
+    const variants = prodData.result?.sync_variants || [];
+
+    const variantMap = buildVariantMap()[productKey] || {};
+    const ourSizes = new Set(Object.keys(variantMap).map(k => k.includes('|') ? k.split('|')[0] : k));
+
+    // A size is available if ANY color variant for it is active
+    const sizeStatusMap = {};
+    for (const v of variants) {
+      const size = v.size;
+      if (!ourSizes.has(size)) continue;
+      const status = v.availability_status;
+      if (!sizeStatusMap[size] || status === 'active') sizeStatusMap[size] = status;
+    }
+
+    const allOutOfStock = ourSizes.size > 0 &&
+      [...ourSizes].every(s => sizeStatusMap[s] && sizeStatusMap[s] !== 'active');
+
+    const data = { sizes: sizeStatusMap, allOutOfStock };
+    stockCache.set(productKey, { data, expiresAt: Date.now() + STOCK_CACHE_TTL });
+    console.log(`[Stock] ${productKey}: ${JSON.stringify(sizeStatusMap)}`);
+    res.json(data);
+  } catch (err) {
+    console.error('[Stock]', productKey, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── COLOR DETECTION ─────────────────────────────────────────────────────────
 app.get('/api/color', async (req, res) => {
   const { url } = req.query;
