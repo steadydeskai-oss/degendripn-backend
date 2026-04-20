@@ -953,7 +953,7 @@ app.post('/api/webhook', async (req, res) => {
     );
   }
   res.json({ received: true });
-}
+});
 
 async function handleCompletedSession(session) {
   const orderId = session.metadata?.order_id;
@@ -1019,7 +1019,6 @@ async function handleCompletedSession(session) {
     stripeSessionId: session.id, stripePaymentIntent: session.payment_intent });
   if (orderId) await orderStoreDel(orderId);
 }
-});
 
 // ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────────
 
