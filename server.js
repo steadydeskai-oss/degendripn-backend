@@ -376,12 +376,13 @@ app.get('/api/productphoto/:catalogProductId', async (req, res) => {
 });
 
 // ─── TEMP IMAGE STORE ────────────────────────────────────────────────────────
-// Holds composited design PNGs in memory for Printful to fetch during mockup generation.
-const tempImageStore = new Map(); // uuid → { buffer, created }
+// Content-addressable: keyed by sha256 of image bytes.
+// Same pixel content → same hash → same URL → mockup cache hits.
+const tempImageStore = new Map(); // contentHash → { buffer, created, designUrl? }
 setInterval(() => {
   const cutoff = Date.now() - 15 * 60 * 1000;
-  for (const [uuid, entry] of tempImageStore)
-    if (entry.created < cutoff) tempImageStore.delete(uuid);
+  for (const [hash, entry] of tempImageStore)
+    if (entry.created < cutoff) tempImageStore.delete(hash);
 }, 60_000);
 
 // Serve a temporarily stored image (Printful fetches this during file upload)
@@ -404,10 +405,22 @@ app.post('/api/upload-design', async (req, res) => {
   try {
     const b64 = base64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(b64, 'base64');
-    const { randomBytes } = require('crypto');
-    const uuid = randomBytes(16).toString('hex');
-    tempImageStore.set(uuid, { buffer, created: Date.now() });
-    console.log(`[upload-design] Stored ${(buffer.length / 1024).toFixed(0)} KB as uuid=${uuid}`);
+
+    // Content-addressable key: sha256 of raw image bytes.
+    // Same composite (same logo position + text + colors) → same hash → same URL → mockup cache hits.
+    const { createHash } = require('crypto');
+    const contentHash = createHash('sha256').update(buffer).digest('hex');
+
+    // If we've already processed this exact image, return the cached designUrl immediately.
+    const existing = tempImageStore.get(contentHash);
+    if (existing?.designUrl) {
+      console.log(`[upload-design] CACHE HIT hash=${contentHash.slice(0,12)}… — reusing ${existing.designUrl}`);
+      return res.json({ designUrl: existing.designUrl, contentHash });
+    }
+
+    // Store buffer (or refresh TTL for an entry without a designUrl yet)
+    tempImageStore.set(contentHash, { buffer, created: Date.now(), designUrl: null });
+    console.log(`[upload-design] New image ${(buffer.length / 1024).toFixed(0)} KB → hash=${contentHash.slice(0,12)}…`);
 
     // Auto-detect Railway public URL so BACKEND_URL doesn't need to be set manually
     const backendUrl = (
@@ -419,9 +432,9 @@ app.post('/api/upload-design', async (req, res) => {
       return res.json({ designUrl: null });
     }
 
-    const tempUrl = `${backendUrl}/api/tmp/${uuid}`;
+    const tempUrl = `${backendUrl}/api/tmp/${contentHash}`;
 
-    if (!process.env.PRINTFUL_API_KEY) return res.json({ designUrl: tempUrl });
+    if (!process.env.PRINTFUL_API_KEY) return res.json({ designUrl: tempUrl, contentHash });
 
     // Upload to Printful file library → permanent CDN URL
     const pfHeaders = {
@@ -432,13 +445,18 @@ app.post('/api/upload-design', async (req, res) => {
     const uploadRes  = await fetch('https://api.printful.com/files', {
       method:  'POST',
       headers: pfHeaders,
-      body:    JSON.stringify({ type: 'default', url: tempUrl, filename: `design_${uuid}.png` }),
+      body:    JSON.stringify({ type: 'default', url: tempUrl, filename: `design_${contentHash.slice(0,16)}.png` }),
     });
     const uploadData = await uploadRes.json();
     console.log(`[upload-design] Printful /files HTTP ${uploadRes.status}:`, JSON.stringify(uploadData));
 
     const designUrl = uploadData.result?.url || tempUrl;
-    res.json({ designUrl });
+
+    // Cache the resolved CDN URL so future uploads of the same bytes skip Printful entirely
+    const entry = tempImageStore.get(contentHash);
+    if (entry) entry.designUrl = designUrl;
+
+    res.json({ designUrl, contentHash });
   } catch (err) {
     console.error('[upload-design] Error:', err.message);
     res.status(500).json({ error: err.message });
@@ -447,11 +465,12 @@ app.post('/api/upload-design', async (req, res) => {
 
 // ─── MOCKUP GENERATION ────────────────────────────────────────────────────────
 // POST /api/mockup
-// Body: { productKey, imageUrl, color, size, position: { xPct, yPct, wPct, hPct } }
+// Body: { productKey, imageUrl, contentHash?, color, size, position: { xPct, yPct, wPct, hPct } }
+//   contentHash (optional): sha256 of composited image bytes — used as cache key instead of imageUrl
 //   xPct/yPct = top-left corner as fraction of print area (0–1)
 //   wPct/hPct = logo size as fraction of print area (0–1)
 app.post('/api/mockup', async (req, res) => {
-  const { productKey, imageUrl, position, color, size } = req.body;
+  const { productKey, imageUrl, position, color, size, contentHash } = req.body;
   if (!productKey || !imageUrl)
     return res.status(400).json({ error: 'Missing productKey or imageUrl' });
   if (!process.env.PRINTFUL_API_KEY)
@@ -460,10 +479,16 @@ app.post('/api/mockup', async (req, res) => {
   // Default: logo centered at 50% width
   const pos = position || { xPct: 0.25, yPct: 0.25, wPct: 0.50, hPct: 0.50 };
   const sig = [pos.xPct, pos.yPct, pos.wPct, pos.hPct].map(v => Math.round(v * 1000)).join('_');
-  const cacheKey = `v2:${productKey}:${color || ''}:${size || ''}:${imageUrl}:${sig}`;
+  // Use content hash when available (composite uploads) — URL changes each run, hash is stable.
+  // v3 prefix busts old v2 entries that used the URL.
+  const imgKey = contentHash || imageUrl;
+  const cacheKey = `v3:${productKey}:${color || ''}:${size || ''}:${imgKey}:${sig}`;
 
-  if (mockupCache.has(cacheKey))
+  if (mockupCache.has(cacheKey)) {
+    console.log(`[Mockup] CACHE HIT ${cacheKey}`);
     return res.json({ mockupUrl: mockupCache.get(cacheKey) });
+  }
+  console.log(`[Mockup] CACHE MISS ${cacheKey}`);
 
   const pfHeaders = {
     'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
