@@ -297,22 +297,33 @@ app.get('/api/stock/:productKey', async (req, res) => {
 
     const variantMap = buildVariantMap()[productKey] || {};
     const ourSizes = new Set(Object.keys(variantMap).map(k => k.includes('|') ? k.split('|')[0] : k));
+    // Case-insensitive lookup: Printful may return "One size" while our keys use "One Size"
+    const normSizeMap = new Map([...ourSizes].map(s => [s.toLowerCase(), s]));
 
-    // A size is available if ANY color variant for it is active
+    // Per-size: available if ANY color variant for it is active
+    // Per-color: tracked independently so color buttons can be marked OOS
     const sizeStatusMap = {};
+    const colorStatusMap = {};
     for (const v of variants) {
-      const size = v.size;
-      if (!ourSizes.has(size)) continue;
-      const status = v.availability_status;
-      if (!sizeStatusMap[size] || status === 'active') sizeStatusMap[size] = status;
+      const pfSize  = v.size  || '';
+      const color   = v.color || '';
+      const status  = v.availability_status;
+      const ourSize = normSizeMap.get(pfSize.toLowerCase());
+
+      if (ourSize) {
+        if (!sizeStatusMap[ourSize] || status === 'active') sizeStatusMap[ourSize] = status;
+      }
+      if (color) {
+        if (!colorStatusMap[color] || status === 'active') colorStatusMap[color] = status;
+      }
     }
 
     const allOutOfStock = ourSizes.size > 0 &&
       [...ourSizes].every(s => sizeStatusMap[s] && sizeStatusMap[s] !== 'active');
 
-    const data = { sizes: sizeStatusMap, allOutOfStock };
+    const data = { sizes: sizeStatusMap, colors: colorStatusMap, allOutOfStock };
     stockCache.set(productKey, { data, expiresAt: Date.now() + STOCK_CACHE_TTL });
-    console.log(`[Stock] ${productKey}: ${JSON.stringify(sizeStatusMap)}`);
+    console.log(`[Stock] ${productKey}: sizes=${JSON.stringify(sizeStatusMap)} colors=${JSON.stringify(colorStatusMap)}`);
     res.json(data);
   } catch (err) {
     console.error('[Stock]', productKey, err.message);
