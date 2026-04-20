@@ -646,6 +646,28 @@ function customerShippingCost(printfulRate) {
   return Math.max(0, parseFloat(printfulRate) - SHIPPING_BASELINE);
 }
 
+// ─── PRODUCTION COST LOOKUP ──────────────────────────────────────────────────
+// syncVariantId → { cost, expiresAt } — 24h TTL (prices rarely change)
+const productionCostCache = new Map();
+
+async function getProductionCost(syncVariantId, pfHeaders) {
+  const cached = productionCostCache.get(syncVariantId);
+  if (cached && Date.now() < cached.expiresAt) return cached.cost;
+
+  const svRes  = await fetch(`https://api.printful.com/store/variants/${syncVariantId}`, { headers: pfHeaders });
+  const svData = await svRes.json();
+  if (!svRes.ok) throw new Error(`store/variants/${syncVariantId}: ${svData.error?.message}`);
+  const catalogVarId = svData.result.variant_id;
+
+  const cvRes  = await fetch(`https://api.printful.com/products/variant/${catalogVarId}`, { headers: pfHeaders });
+  const cvData = await cvRes.json();
+  if (!cvRes.ok) throw new Error(`products/variant/${catalogVarId}: ${cvData.error?.message}`);
+  const cost = parseFloat(cvData.result.variant.price);
+
+  productionCostCache.set(syncVariantId, { cost, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+  return cost;
+}
+
 // ─── SHIPPING RATES ENDPOINT ─────────────────────────────────────────────────
 app.post('/api/shipping-rates', async (req, res) => {
   const { cart, shipping } = req.body;
@@ -697,34 +719,69 @@ app.post('/api/checkout', async (req, res) => {
       quantity: item.qty,
     }));
 
-    // Determine shipping cost: free for CONUS, real rate otherwise
     const pfHeaders = {
       Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
       'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
     };
-    let shippingCost = 0;
+    const recipient = {
+      address1:     shipping.addr1,
+      city:         shipping.city,
+      country_code: shipping.country,
+      state_code:   shipping.state || '',
+      zip:          shipping.zip   || '',
+    };
+
+    // Always fetch raw Printful shipping rate — used for both customer charge and profit calc
+    let rawPrintfulShipping = 0;
     let shippingLabel = 'Free shipping';
-    if (!isCONUS(shipping.country, shipping.state)) {
-      const recipient = {
-        address1:     shipping.addr1,
-        city:         shipping.city,
-        country_code: shipping.country,
-        state_code:   shipping.state || '',
-        zip:          shipping.zip   || '',
-      };
-      try {
-        const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
-        if (rates.length) {
-          const best = cheapestRate(rates);
-          shippingCost = customerShippingCost(best.rate);
-          shippingLabel = best.name;
+    let shippingCost = 0; // what customer actually pays
+    try {
+      const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
+      if (rates.length) {
+        const best = cheapestRate(rates);
+        rawPrintfulShipping = parseFloat(best.rate);
+        shippingLabel = best.name;
+        shippingCost = isCONUS(shipping.country, shipping.state)
+          ? 0
+          : customerShippingCost(rawPrintfulShipping);
+      }
+    } catch (e) {
+      console.warn('[checkout] Could not fetch shipping rate:', e.message);
+      rawPrintfulShipping = isCONUS(shipping.country, shipping.state) ? 5 : 12; // conservative estimate
+      shippingCost = isCONUS(shipping.country, shipping.state) ? 0 : Math.max(0, rawPrintfulShipping - SHIPPING_BASELINE);
+      shippingLabel = 'Shipping & handling';
+    }
+
+    // Fetch production cost per item (cached 24h) and run profit guard
+    const customerRevenue = cart.reduce((s, i) => s + i.price * (i.qty || 1), 0) + shippingCost;
+    let totalProductionCost = 0;
+    for (const item of cart) {
+      const syncVarId = getVariantId(item.pid, item.size, item.color);
+      if (syncVarId) {
+        try {
+          const cost = await getProductionCost(syncVarId, pfHeaders);
+          totalProductionCost += cost * (item.qty || 1);
+        } catch (e) {
+          console.warn(`[checkout] Could not get production cost for ${item.pid}/${item.size}:`, e.message);
         }
-      } catch (e) {
-        console.warn('[checkout] Could not fetch shipping rate:', e.message);
-        shippingCost = 9.99; // safe fallback if Printful unreachable
-        shippingLabel = 'Shipping & handling';
       }
     }
+    const profit = customerRevenue - totalProductionCost - rawPrintfulShipping;
+    const MIN_PROFIT = 2.00;
+    if (profit < MIN_PROFIT) {
+      console.warn(
+        `[checkout] BLOCKED low-profit order — profit=$${profit.toFixed(2)} ` +
+        `revenue=$${customerRevenue.toFixed(2)} pf_prod=$${totalProductionCost.toFixed(2)} ` +
+        `pf_ship=$${rawPrintfulShipping.toFixed(2)} ` +
+        `country=${shipping.country} state=${shipping.state || ''} ` +
+        `cart=${JSON.stringify(cart.map(i => ({ pid: i.pid, size: i.size, qty: i.qty, price: i.price })))}`
+      );
+      return res.status(422).json({
+        error: "Sorry, we're unable to fulfill orders to your location for this cart. Please try a different shipping address or different items.",
+      });
+    }
+    console.log(`[checkout] Profit check OK — profit=$${profit.toFixed(2)} revenue=$${customerRevenue.toFixed(2)} pf_prod=$${totalProductionCost.toFixed(2)} pf_ship=$${rawPrintfulShipping.toFixed(2)}`);
+
     if (shippingCost > 0) {
       lineItems.push({
         price_data: { currency: 'usd', product_data: { name: shippingLabel }, unit_amount: Math.round(shippingCost * 100) },
