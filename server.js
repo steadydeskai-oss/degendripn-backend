@@ -597,6 +597,82 @@ app.post('/api/mockup', async (req, res) => {
   }
 });
 
+// ─── SHIPPING HELPERS ────────────────────────────────────────────────────────
+// Non-CONUS US states/territories that Printful treats as international shipping
+const NON_CONUS = new Set(['AK','HI','PR','GU','VI','AS','MP','UM']);
+
+function isCONUS(country, state) {
+  return country === 'US' && !NON_CONUS.has((state || '').toUpperCase().trim());
+}
+
+const shippingRateCache = new Map(); // cacheKey → { rates, expiresAt }
+
+async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
+  const pfItems = cartItems.flatMap(item => {
+    const vid = getVariantId(item.pid, item.size, item.color);
+    return vid ? [{ quantity: item.qty || 1, variant_id: parseInt(vid) }] : [];
+  });
+  if (pfItems.length === 0) return [];
+
+  const body = { recipient, items: pfItems, currency: 'USD', locale: 'en_US' };
+  const cacheKey = JSON.stringify(body);
+  const cached = shippingRateCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
+    console.log('[shipping] cache hit');
+    return cached.rates;
+  }
+
+  const res  = await fetch('https://api.printful.com/shipping/rates', {
+    method:  'POST',
+    headers: { ...pfHeaders, 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  });
+  const data = await res.json();
+  console.log('[shipping] Printful /shipping/rates HTTP', res.status, JSON.stringify(data).slice(0, 300));
+  if (!res.ok) throw new Error(data.error?.message || JSON.stringify(data));
+
+  const rates = data.result || [];
+  shippingRateCache.set(cacheKey, { rates, expiresAt: Date.now() + 5 * 60 * 1000 });
+  return rates;
+}
+
+function cheapestRate(rates) {
+  return rates.reduce((a, b) => parseFloat(a.rate) <= parseFloat(b.rate) ? a : b, rates[0]);
+}
+
+// ─── SHIPPING RATES ENDPOINT ─────────────────────────────────────────────────
+app.post('/api/shipping-rates', async (req, res) => {
+  const { cart, shipping } = req.body;
+  if (!cart || !shipping) return res.status(400).json({ error: 'Missing cart or shipping' });
+
+  if (isCONUS(shipping.country, shipping.state)) {
+    return res.json({ isFree: true, cost: 0, label: 'Free' });
+  }
+
+  const pfHeaders = {
+    Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
+  };
+  const recipient = {
+    address1:     shipping.addr1 || '1 Main St',
+    city:         shipping.city  || 'City',
+    country_code: shipping.country,
+    state_code:   shipping.state || '',
+    zip:          shipping.zip   || '',
+  };
+  try {
+    const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
+    if (!rates.length) {
+      return res.status(422).json({ error: 'Printful does not ship to this destination.' });
+    }
+    const best = cheapestRate(rates);
+    res.json({ isFree: false, cost: parseFloat(best.rate), label: best.name });
+  } catch (err) {
+    console.error('[shipping-rates]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── STRIPE CHECKOUT ──────────────────────────────────────────────────────────
 app.post('/api/checkout', async (req, res) => {
   const { cart, shipping, tokenName, tokenSym } = req.body;
@@ -613,7 +689,41 @@ app.post('/api/checkout', async (req, res) => {
       },
       quantity: item.qty,
     }));
-    lineItems.push({ price_data: { currency:'usd', product_data:{name:'Shipping & handling'}, unit_amount:499 }, quantity:1 });
+
+    // Determine shipping cost: free for CONUS, real rate otherwise
+    const pfHeaders = {
+      Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
+      'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
+    };
+    let shippingCost = 0;
+    let shippingLabel = 'Free shipping';
+    if (!isCONUS(shipping.country, shipping.state)) {
+      const recipient = {
+        address1:     shipping.addr1,
+        city:         shipping.city,
+        country_code: shipping.country,
+        state_code:   shipping.state || '',
+        zip:          shipping.zip   || '',
+      };
+      try {
+        const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
+        if (rates.length) {
+          const best = cheapestRate(rates);
+          shippingCost = parseFloat(best.rate);
+          shippingLabel = best.name;
+        }
+      } catch (e) {
+        console.warn('[checkout] Could not fetch shipping rate:', e.message);
+        shippingCost = 9.99; // safe fallback if Printful unreachable
+        shippingLabel = 'Shipping & handling';
+      }
+    }
+    if (shippingCost > 0) {
+      lineItems.push({
+        price_data: { currency: 'usd', product_data: { name: shippingLabel }, unit_amount: Math.round(shippingCost * 100) },
+        quantity: 1,
+      });
+    }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -623,10 +733,11 @@ app.post('/api/checkout', async (req, res) => {
       cancel_url:  `${process.env.FRONTEND_URL}?order=cancelled`,
       customer_email: shipping.email,
       metadata: {
-        cart:       JSON.stringify(cart),
-        shipping:   JSON.stringify(shipping),
-        token_name: tokenName,
-        token_sym:  tokenSym,
+        cart:          JSON.stringify(cart),
+        shipping:      JSON.stringify(shipping),
+        token_name:    tokenName,
+        token_sym:     tokenSym,
+        shipping_cost: String(shippingCost),
       },
     });
     res.json({ url: session.url });
@@ -698,7 +809,7 @@ async function createPrintfulOrder(stripeSession) {
       email:        shipping.email,
     },
     items,
-    retail_costs: { shipping: '4.99' },
+    retail_costs: { shipping: (parseFloat(stripeSession.metadata.shipping_cost) || 0).toFixed(2) },
   };
 
   const response = await fetch('https://api.printful.com/orders', {
