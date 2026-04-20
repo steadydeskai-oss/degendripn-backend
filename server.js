@@ -15,7 +15,7 @@ const MOCKUP_CACHE_FILE = path.join(__dirname, 'mockup-cache.json');
 let _cacheData = {};
 try { _cacheData = JSON.parse(fs.readFileSync(MOCKUP_CACHE_FILE, 'utf8')); } catch {}
 const mockupCache = new Map(
-  Object.entries(_cacheData).filter(([k]) => !k.startsWith('v2:mug:'))
+  Object.entries(_cacheData).filter(([k]) => !k.startsWith('v2:mug:') && !k.startsWith('v2:pins:'))
 );
 
 function saveMockupCache() {
@@ -440,10 +440,17 @@ app.post('/api/mockup', async (req, res) => {
     console.log(`  print area: ${area_width}×${area_height}  logo: ${imgW}×${imgH} at (${left},${top})`);
     console.log(`  image_url: ${proxied}`);
 
+    // Pins: fill all 5 placements so every pin shows the design
+    const PIN_PLACEMENTS = ['front', 'first', 'second', 'third', 'fourth'];
+    const taskFiles = productKey === 'pins'
+      ? PIN_PLACEMENTS.map(p => ({ placement: p, image_url: proxied, position: pfPosition }))
+      : [{ placement: placementName, image_url: proxied, position: pfPosition }];
+
     const taskBody = {
-      variant_ids: [catalogVariantId],
-      files:       [{ placement: placementName, image_url: proxied, position: pfPosition }],
-      format:      'jpg',
+      variant_ids:   [catalogVariantId],
+      files:         taskFiles,
+      format:        'jpg',
+      ...(productKey === 'pins' ? { option_groups: ['Flat'] } : {}),
     };
 
     const taskRes  = await fetch(`https://api.printful.com/mockup-generator/create-task/${catalogProductId}`, {
