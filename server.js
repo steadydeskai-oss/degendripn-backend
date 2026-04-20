@@ -252,7 +252,16 @@ function getVariantId(pid, size, color) {
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-app.use(cors({ origin: true, credentials: true }));
+const ALLOWED_ORIGINS = [
+  'https://degendrip.net',
+  'https://www.degendrip.net',
+  'https://degendrip.netlify.app',
+  'http://localhost:5500',
+];
+app.use(cors({
+  origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)),
+  credentials: true,
+}));
 app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
