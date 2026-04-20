@@ -6,9 +6,35 @@ const fetch   = require('node-fetch');
 const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const fs      = require('fs');
 const path    = require('path');
+const { checkText, checkCart } = require('./moderation');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
+
+// ─── Pending orders store ──────────────────────────────────────────────────────
+// Orders held for content review (soft-block). Persisted to JSON file so they
+// survive server restarts within the same deployment. For production, replace
+// with a proper database (Postgres/Redis).
+const PENDING_FILE = path.join(__dirname, 'pending-orders.json');
+let _pendingData = {};
+try { _pendingData = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8')); } catch {}
+const pendingOrders = new Map(Object.entries(_pendingData)); // id → order object
+
+function savePendingOrders() {
+  const obj = {};
+  for (const [k, v] of pendingOrders) obj[k] = v;
+  try { fs.writeFileSync(PENDING_FILE, JSON.stringify(obj, null, 2)); } catch {}
+}
+
+// ─── Admin auth middleware ────────────────────────────────────────────────────
+function requireAdmin(req, res, next) {
+  const adminPw = process.env.ADMIN_PASSWORD;
+  if (!adminPw) return res.status(503).json({ error: 'ADMIN_PASSWORD not configured' });
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (token !== adminPw) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
 
 // ─── Disk-backed mockup cache ─────────────────────────────────────────────────
 const MOCKUP_CACHE_FILE = path.join(__dirname, 'mockup-cache.json');
@@ -269,8 +295,19 @@ app.use(express.urlencoded({ limit: '25mb', extended: true }));
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.resolve(__dirname, '../DegenDrip_v14.html')));
 
+// ─── Admin dashboard ──────────────────────────────────────────────────────────
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ─── Text moderation check ────────────────────────────────────────────────────
+app.post('/api/check-text', (req, res) => {
+  const { text } = req.body;
+  if (typeof text !== 'string') return res.status(400).json({ error: 'Missing text' });
+  const result = checkText(text);
+  res.json(result);
+});
 
 // ─── Stock status ─────────────────────────────────────────────────────────────
 const stockCache = new Map(); // productKey -> { data, expiresAt }
@@ -717,6 +754,20 @@ app.post('/api/shipping-rates', async (req, res) => {
 app.post('/api/checkout', async (req, res) => {
   const { cart, shipping, tokenName, tokenSym } = req.body;
   if (!cart || cart.length === 0) return res.status(400).json({ error: 'Empty cart' });
+
+  // ── Content moderation ─────────────────────────────────────────────────────
+  const modFlags = checkCart(cart);
+  const hardBlocked = modFlags.filter(f => f.result === 'blocked');
+  if (hardBlocked.length > 0) {
+    console.warn('[checkout] HARD BLOCK — flagged text:', hardBlocked.map(f => `"${f.text}" (${f.category})`).join(', '));
+    return res.status(422).json({ error: 'This text is not allowed. Please choose different text.' });
+  }
+  const needsReview = modFlags.filter(f => f.result === 'review');
+  if (needsReview.length > 0) {
+    console.warn('[checkout] SOFT REVIEW — flagged text:', needsReview.map(f => `"${f.text}" (${f.category})`).join(', '));
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   try {
     const lineItems = cart.map(item => ({
       price_data: {
@@ -808,11 +859,12 @@ app.post('/api/checkout', async (req, res) => {
       cancel_url:  `${process.env.FRONTEND_URL}?order=cancelled`,
       customer_email: shipping.email,
       metadata: {
-        cart:          JSON.stringify(cart),
-        shipping:      JSON.stringify(shipping),
-        token_name:    tokenName,
-        token_sym:     tokenSym,
-        shipping_cost: String(shippingCost),
+        cart:              JSON.stringify(cart),
+        shipping:          JSON.stringify(shipping),
+        token_name:        tokenName,
+        token_sym:         tokenSym,
+        shipping_cost:     String(shippingCost),
+        moderation_flags:  needsReview.length > 0 ? JSON.stringify(needsReview) : '',
       },
     });
     res.json({ url: session.url });
@@ -833,9 +885,116 @@ app.post('/api/webhook', async (req, res) => {
   }
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-    createPrintfulOrder(session).catch(err => console.error('Printful order failed:', err.message));
+
+    // Re-check moderation from stored metadata (belt-and-suspenders)
+    let storedFlags = [];
+    try {
+      const flagsJson = session.metadata?.moderation_flags;
+      storedFlags = flagsJson ? JSON.parse(flagsJson) : [];
+    } catch {}
+
+    // Also re-run against the cart (catches any bypass attempt)
+    let cart = [];
+    try { cart = JSON.parse(session.metadata.cart || '[]'); } catch {}
+    const liveFlags = checkCart(cart);
+    const hardBlocked = liveFlags.filter(f => f.result === 'blocked');
+
+    if (hardBlocked.length > 0) {
+      // This shouldn't reach here (caught at checkout), but hard-block as safety net.
+      // Refund and log — no Printful order.
+      console.error('[webhook] HARD BLOCK at webhook — auto-refunding session', session.id);
+      if (session.payment_intent) {
+        stripe.refunds.create({ payment_intent: session.payment_intent })
+          .catch(e => console.error('[webhook] Refund failed:', e.message));
+      }
+    } else if (storedFlags.length > 0 || liveFlags.filter(f => f.result === 'review').length > 0) {
+      // Soft review: hold for admin approval
+      const allFlags = storedFlags.length > 0 ? storedFlags : liveFlags.filter(f => f.result === 'review');
+      const orderId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      let shipping = {};
+      try { shipping = JSON.parse(session.metadata.shipping || '{}'); } catch {}
+      const order = {
+        id: orderId,
+        stripeSessionId:     session.id,
+        stripePaymentIntent: session.payment_intent || null,
+        cart,
+        shipping,
+        tokenName:  session.metadata.token_name || '',
+        tokenSym:   session.metadata.token_sym  || '',
+        shippingCost: parseFloat(session.metadata.shipping_cost || '0'),
+        moderationFlags: allFlags,
+        status:     'pending',
+        createdAt:  new Date().toISOString(),
+      };
+      pendingOrders.set(orderId, order);
+      savePendingOrders();
+      console.warn(`[webhook] Order HELD for review — ${orderId} — ${shipping.email} — flags: ${allFlags.map(f=>`"${f.text}"`).join(', ')}`);
+    } else {
+      createPrintfulOrder(session).catch(err => console.error('Printful order failed:', err.message));
+    }
   }
   res.json({ received: true });
+});
+
+// ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────────
+
+app.get('/api/admin/pending-orders', requireAdmin, (req, res) => {
+  const orders = Array.from(pendingOrders.values())
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json(orders);
+});
+
+app.post('/api/admin/approve-order/:id', requireAdmin, async (req, res) => {
+  const order = pendingOrders.get(req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (order.status !== 'pending') return res.status(409).json({ error: `Order is already ${order.status}` });
+
+  try {
+    // Build a synthetic stripe session object that createPrintfulOrder expects
+    const fakeSession = {
+      id:               order.stripeSessionId,
+      payment_intent:   order.stripePaymentIntent,
+      customer_email:   order.shipping?.email || '',
+      metadata: {
+        cart:          JSON.stringify(order.cart),
+        shipping:      JSON.stringify(order.shipping),
+        token_name:    order.tokenName,
+        token_sym:     order.tokenSym,
+        shipping_cost: String(order.shippingCost || 0),
+      },
+    };
+    const result = await createPrintfulOrder(fakeSession);
+    order.status        = 'approved';
+    order.approvedAt    = new Date().toISOString();
+    order.printfulOrderId = result?.result?.id || null;
+    savePendingOrders();
+    console.log(`[admin] APPROVED order ${order.id} → Printful #${order.printfulOrderId}`);
+    res.json({ ok: true, printfulOrderId: order.printfulOrderId });
+  } catch (err) {
+    console.error('[admin] approve failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/reject-order/:id', requireAdmin, async (req, res) => {
+  const order = pendingOrders.get(req.params.id);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  if (order.status !== 'pending') return res.status(409).json({ error: `Order is already ${order.status}` });
+
+  try {
+    if (order.stripePaymentIntent) {
+      await stripe.refunds.create({ payment_intent: order.stripePaymentIntent });
+      console.log(`[admin] Refunded payment_intent ${order.stripePaymentIntent}`);
+    }
+    order.status     = 'rejected';
+    order.rejectedAt = new Date().toISOString();
+    savePendingOrders();
+    console.log(`[admin] REJECTED order ${order.id}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[admin] reject/refund failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── PRINTFUL ORDER ───────────────────────────────────────────────────────────
