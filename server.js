@@ -11,6 +11,19 @@ const { checkText, checkCart } = require('./moderation');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// ─── Order data store ─────────────────────────────────────────────────────────
+// Holds full cart + shipping between /api/checkout (session creation) and the
+// Stripe webhook (fulfillment). In-memory is fine — both happen on the same
+// process within seconds to minutes. 24-hour TTL cleans up uncompleted sessions.
+// Upgrade to Redis if you need multi-instance or restart resilience.
+const { randomBytes } = require('crypto');
+const orderStore = new Map(); // orderId → { cart, shipping, tokenName, tokenSym, shippingCost, moderationFlags, createdAt }
+setInterval(() => {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [id, entry] of orderStore)
+    if (Date.parse(entry.createdAt) < cutoff) orderStore.delete(id);
+}, 60 * 60 * 1000);
+
 // ─── Pending orders store ──────────────────────────────────────────────────────
 // Orders held for content review (soft-block). Persisted to JSON file so they
 // survive server restarts within the same deployment. For production, replace
@@ -851,6 +864,21 @@ app.post('/api/checkout', async (req, res) => {
       });
     }
 
+    // Store full order data in memory — webhook fetches it by orderId.
+    // This keeps Stripe metadata well under the 500-char-per-value limit.
+    const orderId = `order_${randomBytes(8).toString('hex')}`;
+    // Strip thumbnailUrl (large data URL) — not needed for fulfillment
+    const cartForStore = cart.map(({ thumbnailUrl: _t, ...rest }) => rest);
+    orderStore.set(orderId, {
+      cart:            cartForStore,
+      shipping,
+      tokenName:       tokenName || '',
+      tokenSym:        tokenSym  || '',
+      shippingCost,
+      moderationFlags: needsReview,
+      createdAt:       new Date().toISOString(),
+    });
+
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items:  lineItems,
@@ -859,12 +887,10 @@ app.post('/api/checkout', async (req, res) => {
       cancel_url:  `${process.env.FRONTEND_URL}?order=cancelled`,
       customer_email: shipping.email,
       metadata: {
-        cart:              JSON.stringify(cart),
-        shipping:          JSON.stringify(shipping),
-        token_name:        tokenName,
-        token_sym:         tokenSym,
-        shipping_cost:     String(shippingCost),
-        moderation_flags:  needsReview.length > 0 ? JSON.stringify(needsReview) : '',
+        order_id:      orderId,
+        token_name:    tokenName  || '',
+        token_sym:     tokenSym   || '',
+        shipping_cost: String(shippingCost),
       },
     });
     res.json({ url: session.url });
@@ -885,55 +911,77 @@ app.post('/api/webhook', async (req, res) => {
   }
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
-
-    // Re-check moderation from stored metadata (belt-and-suspenders)
-    let storedFlags = [];
-    try {
-      const flagsJson = session.metadata?.moderation_flags;
-      storedFlags = flagsJson ? JSON.parse(flagsJson) : [];
-    } catch {}
-
-    // Also re-run against the cart (catches any bypass attempt)
-    let cart = [];
-    try { cart = JSON.parse(session.metadata.cart || '[]'); } catch {}
-    const liveFlags = checkCart(cart);
-    const hardBlocked = liveFlags.filter(f => f.result === 'blocked');
-
-    if (hardBlocked.length > 0) {
-      // This shouldn't reach here (caught at checkout), but hard-block as safety net.
-      // Refund and log — no Printful order.
-      console.error('[webhook] HARD BLOCK at webhook — auto-refunding session', session.id);
-      if (session.payment_intent) {
-        stripe.refunds.create({ payment_intent: session.payment_intent })
-          .catch(e => console.error('[webhook] Refund failed:', e.message));
-      }
-    } else if (storedFlags.length > 0 || liveFlags.filter(f => f.result === 'review').length > 0) {
-      // Soft review: hold for admin approval
-      const allFlags = storedFlags.length > 0 ? storedFlags : liveFlags.filter(f => f.result === 'review');
-      const orderId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      let shipping = {};
-      try { shipping = JSON.parse(session.metadata.shipping || '{}'); } catch {}
-      const order = {
-        id: orderId,
-        stripeSessionId:     session.id,
-        stripePaymentIntent: session.payment_intent || null,
-        cart,
-        shipping,
-        tokenName:  session.metadata.token_name || '',
-        tokenSym:   session.metadata.token_sym  || '',
-        shippingCost: parseFloat(session.metadata.shipping_cost || '0'),
-        moderationFlags: allFlags,
-        status:     'pending',
-        createdAt:  new Date().toISOString(),
-      };
-      pendingOrders.set(orderId, order);
-      savePendingOrders();
-      console.warn(`[webhook] Order HELD for review — ${orderId} — ${shipping.email} — flags: ${allFlags.map(f=>`"${f.text}"`).join(', ')}`);
-    } else {
-      createPrintfulOrder(session).catch(err => console.error('Printful order failed:', err.message));
-    }
+    handleCompletedSession(session).catch(err =>
+      console.error('[webhook] handleCompletedSession failed:', err.message)
+    );
   }
   res.json({ received: true });
+}
+
+async function handleCompletedSession(session) {
+  const orderId = session.metadata?.order_id;
+
+  // Fetch full order data from in-memory store; fall back to legacy metadata format
+  let orderData = orderId ? orderStore.get(orderId) : null;
+  if (!orderData) {
+    // Backwards-compat: sessions created before this change stored cart in metadata
+    console.warn('[webhook] orderStore miss for', orderId, '— falling back to metadata');
+    let cart = [], shipping = {};
+    try { cart     = JSON.parse(session.metadata.cart     || '[]'); } catch {}
+    try { shipping = JSON.parse(session.metadata.shipping || '{}'); } catch {}
+    orderData = {
+      cart,
+      shipping,
+      tokenName:       session.metadata.token_name    || '',
+      tokenSym:        session.metadata.token_sym     || '',
+      shippingCost:    parseFloat(session.metadata.shipping_cost || '0'),
+      moderationFlags: (() => { try { return JSON.parse(session.metadata.moderation_flags || '[]'); } catch { return []; } })(),
+    };
+  }
+
+  const { cart, shipping, tokenName, tokenSym, shippingCost, moderationFlags = [] } = orderData;
+
+  // Belt-and-suspenders hard-block re-check
+  const liveFlags  = checkCart(cart);
+  const hardBlocked = liveFlags.filter(f => f.result === 'blocked');
+  if (hardBlocked.length > 0) {
+    console.error('[webhook] HARD BLOCK — auto-refunding session', session.id);
+    if (session.payment_intent) {
+      stripe.refunds.create({ payment_intent: session.payment_intent })
+        .catch(e => console.error('[webhook] Refund failed:', e.message));
+    }
+    if (orderId) orderStore.delete(orderId);
+    return;
+  }
+
+  const reviewFlags = moderationFlags.length > 0
+    ? moderationFlags
+    : liveFlags.filter(f => f.result === 'review');
+
+  if (reviewFlags.length > 0) {
+    // Soft review: hold for admin
+    const pendingId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const order = {
+      id:                  pendingId,
+      stripeSessionId:     session.id,
+      stripePaymentIntent: session.payment_intent || null,
+      cart, shipping, tokenName, tokenSym, shippingCost,
+      moderationFlags: reviewFlags,
+      status:    'pending',
+      createdAt: new Date().toISOString(),
+    };
+    pendingOrders.set(pendingId, order);
+    savePendingOrders();
+    if (orderId) orderStore.delete(orderId);
+    console.warn(`[webhook] Order HELD — ${pendingId} — ${shipping.email} — flags: ${reviewFlags.map(f => `"${f.text}"`).join(', ')}`);
+    return;
+  }
+
+  // Clean order — send to Printful
+  await createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippingCost,
+    stripeSessionId: session.id, stripePaymentIntent: session.payment_intent });
+  if (orderId) orderStore.delete(orderId);
+}
 });
 
 // ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────────
@@ -950,20 +998,14 @@ app.post('/api/admin/approve-order/:id', requireAdmin, async (req, res) => {
   if (order.status !== 'pending') return res.status(409).json({ error: `Order is already ${order.status}` });
 
   try {
-    // Build a synthetic stripe session object that createPrintfulOrder expects
-    const fakeSession = {
-      id:               order.stripeSessionId,
-      payment_intent:   order.stripePaymentIntent,
-      customer_email:   order.shipping?.email || '',
-      metadata: {
-        cart:          JSON.stringify(order.cart),
-        shipping:      JSON.stringify(order.shipping),
-        token_name:    order.tokenName,
-        token_sym:     order.tokenSym,
-        shipping_cost: String(order.shippingCost || 0),
-      },
-    };
-    const result = await createPrintfulOrder(fakeSession);
+    const result = await createPrintfulOrder({
+      cart:            order.cart,
+      shipping:        order.shipping,
+      tokenName:       order.tokenName,
+      tokenSym:        order.tokenSym,
+      shippingCost:    order.shippingCost || 0,
+      stripeSessionId: order.stripeSessionId,
+    });
     order.status        = 'approved';
     order.approvedAt    = new Date().toISOString();
     order.printfulOrderId = result?.result?.id || null;
@@ -998,10 +1040,7 @@ app.post('/api/admin/reject-order/:id', requireAdmin, async (req, res) => {
 });
 
 // ─── PRINTFUL ORDER ───────────────────────────────────────────────────────────
-async function createPrintfulOrder(stripeSession) {
-  const cart     = JSON.parse(stripeSession.metadata.cart);
-  const shipping = JSON.parse(stripeSession.metadata.shipping);
-
+async function createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippingCost, stripeSessionId }) {
   const pfHeaders = {
     'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
     'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
@@ -1043,7 +1082,7 @@ async function createPrintfulOrder(stripeSession) {
       email:        shipping.email,
     },
     items,
-    retail_costs: { shipping: (parseFloat(stripeSession.metadata.shipping_cost) || 0).toFixed(2) },
+    retail_costs: { shipping: (parseFloat(shippingCost) || 0).toFixed(2) },
   };
 
   const response = await fetch('https://api.printful.com/orders', {
