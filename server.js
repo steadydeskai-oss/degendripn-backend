@@ -1064,5 +1064,11 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Mockup:      POST /api/mockup`);
   console.log(`   Upload:      POST /api/upload-design  (BACKEND_URL=${process.env.BACKEND_URL || 'not set — crop upload disabled'})`);
   console.log(`   Checkout:    POST /api/checkout`);
-  console.log(`   Mockup cache: ${mockupCache.size} entries\n`);
+  console.log(`   Admin:       GET  /admin`);
+  console.log(`   Admin API:   GET  /api/admin/pending-orders`);
+  console.log(`   Admin API:   POST /api/admin/approve-order/:id`);
+  console.log(`   Admin API:   POST /api/admin/reject-order/:id`);
+  console.log(`   Moderation:  POST /api/check-text`);
+  console.log(`   Mockup cache: ${mockupCache.size} entries`);
+  console.log(`   Pending orders: ${pendingOrders.size} loaded\n`);
 });
