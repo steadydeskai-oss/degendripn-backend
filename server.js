@@ -640,6 +640,12 @@ function cheapestRate(rates) {
   return rates.reduce((a, b) => parseFloat(a.rate) <= parseFloat(b.rate) ? a : b, rates[0]);
 }
 
+// We absorb the first $5 of international shipping; customer pays only the excess
+const SHIPPING_BASELINE = 5.00;
+function customerShippingCost(printfulRate) {
+  return Math.max(0, parseFloat(printfulRate) - SHIPPING_BASELINE);
+}
+
 // ─── SHIPPING RATES ENDPOINT ─────────────────────────────────────────────────
 app.post('/api/shipping-rates', async (req, res) => {
   const { cart, shipping } = req.body;
@@ -666,7 +672,8 @@ app.post('/api/shipping-rates', async (req, res) => {
       return res.status(422).json({ error: 'Printful does not ship to this destination.' });
     }
     const best = cheapestRate(rates);
-    res.json({ isFree: false, cost: parseFloat(best.rate), label: best.name });
+    const cost = customerShippingCost(best.rate);
+    res.json({ isFree: cost === 0, cost, label: best.name });
   } catch (err) {
     console.error('[shipping-rates]', err.message);
     res.status(500).json({ error: err.message });
@@ -709,7 +716,7 @@ app.post('/api/checkout', async (req, res) => {
         const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
         if (rates.length) {
           const best = cheapestRate(rates);
-          shippingCost = parseFloat(best.rate);
+          shippingCost = customerShippingCost(best.rate);
           shippingLabel = best.name;
         }
       } catch (e) {
