@@ -1,13 +1,15 @@
 require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const Jimp    = require('jimp');
-const fetch   = require('node-fetch');
-const stripe  = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const fs      = require('fs');
-const path    = require('path');
-const Redis   = require('ioredis');
+const express    = require('express');
+const cors       = require('cors');
+const Jimp       = require('jimp');
+const fetch      = require('node-fetch');
+const stripe     = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const fs         = require('fs');
+const path       = require('path');
+const Redis      = require('ioredis');
+const { Resend } = require('resend');
 const { checkText, checkCart } = require('./moderation');
+const { randomBytes, createHash } = require('crypto');
 
 // ─── Redis client ─────────────────────────────────────────────────────────────
 const redis = process.env.REDIS_URL
@@ -23,12 +25,9 @@ if (redis) {
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── Order data store (Redis) ─────────────────────────────────────────────────
-// Persists full cart + shipping between /api/checkout and the Stripe webhook.
-// Uses Redis with a 24-hour TTL. Falls back to in-memory Map when REDIS_URL is
-// not set (dev) or when Redis is temporarily unavailable (graceful degradation).
-const { randomBytes } = require('crypto');
-const orderStoreFallback = new Map(); // used only when Redis is unavailable
+// ─── Checkout-to-webhook bridge (Redis, 24h TTL) ──────────────────────────────
+// Stores full cart + shipping between /api/checkout and the Stripe webhook.
+const orderStoreFallback = new Map();
 
 async function orderStoreSet(orderId, data) {
   const json = JSON.stringify(data);
@@ -61,29 +60,175 @@ async function orderStoreDel(orderId) {
   orderStoreFallback.delete(orderId);
 }
 
-// ─── Pending orders store ──────────────────────────────────────────────────────
-// Orders held for content review (soft-block). Persisted to JSON file so they
-// survive server restarts within the same deployment. For production, replace
-// with a proper database (Postgres/Redis).
-const PENDING_FILE = path.join(__dirname, 'pending-orders.json');
-let _pendingData = {};
-try { _pendingData = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8')); } catch {}
-const pendingOrders = new Map(Object.entries(_pendingData)); // id → order object
+// ─── Review order store (Redis, 30-day TTL) ──────────────────────────────────
+// ALL paid orders land here with status "pending_review" for manual approval.
+// Indexed by orderId; a list `ro:idx` keeps newest-first insertion order.
+const REVIEW_ORDER_TTL    = 30 * 24 * 60 * 60; // 30 days
+const reviewOrderFallback = new Map();
 
-function savePendingOrders() {
-  const obj = {};
-  for (const [k, v] of pendingOrders) obj[k] = v;
-  try { fs.writeFileSync(PENDING_FILE, JSON.stringify(obj, null, 2)); } catch {}
+async function reviewOrderSave(order) {
+  const json = JSON.stringify(order);
+  if (redis) {
+    try {
+      await redis.setex(`ro:${order.orderId}`, REVIEW_ORDER_TTL, json);
+      await redis.lrem('ro:idx', 0, order.orderId); // remove existing entry (update case)
+      await redis.lpush('ro:idx', order.orderId);
+      await redis.ltrim('ro:idx', 0, 999);
+      return;
+    } catch (e) { console.error('[reviewOrder] Redis save failed:', e.message); }
+  }
+  reviewOrderFallback.set(order.orderId, order);
+}
+
+async function reviewOrderGet(orderId) {
+  if (redis) {
+    try {
+      const raw = await redis.get(`ro:${orderId}`);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { console.error('[reviewOrder] Redis get failed:', e.message); }
+  }
+  return reviewOrderFallback.get(orderId) || null;
+}
+
+async function reviewOrderUpdate(orderId, updates) {
+  const order = await reviewOrderGet(orderId);
+  if (!order) return null;
+  const updated = { ...order, ...updates };
+  await reviewOrderSave(updated);
+  return updated;
+}
+
+async function reviewOrderList(statusFilter) {
+  let orders = [];
+  if (redis) {
+    try {
+      const ids = await redis.lrange('ro:idx', 0, 999);
+      if (ids.length > 0) {
+        const pipeline = redis.pipeline();
+        for (const id of ids) pipeline.get(`ro:${id}`);
+        const results = await pipeline.exec();
+        for (const [err, raw] of results) {
+          if (!err && raw) { try { orders.push(JSON.parse(raw)); } catch {} }
+        }
+      }
+    } catch (e) {
+      console.error('[reviewOrder] Redis list failed:', e.message);
+      orders = Array.from(reviewOrderFallback.values());
+    }
+  } else {
+    orders = Array.from(reviewOrderFallback.values());
+  }
+  orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return statusFilter ? orders.filter(o => o.status === statusFilter) : orders;
 }
 
 // ─── Admin auth middleware ────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
   const adminPw = process.env.ADMIN_PASSWORD;
   if (!adminPw) return res.status(503).json({ error: 'ADMIN_PASSWORD not configured' });
-  const auth = req.headers.authorization || '';
+  const auth  = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   if (token !== adminPw) return res.status(401).json({ error: 'Unauthorized' });
   next();
+}
+
+// ─── Email (Resend) ──────────────────────────────────────────────────────────
+const resend      = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const FROM_EMAIL  = process.env.FROM_EMAIL  || 'no-reply@degendrip.net';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'steadydesk.ai@gmail.com';
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+const emailWrap = (body) => `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#0f0f14">
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f0f14;color:#e0e0e0;padding:40px 24px;max-width:560px;margin:0 auto">
+  <div style="margin-bottom:28px"><span style="font-size:18px;font-weight:700;color:#fff;letter-spacing:-.01em">DegenDrip</span></div>
+  ${body}
+  <div style="margin-top:36px;padding-top:16px;border-top:1px solid #2a2a3a;font-size:12px;color:#555">
+    Questions? Reply to this email. &nbsp;&middot;&nbsp; <a href="https://degendrip.net" style="color:#555">degendrip.net</a>
+  </div>
+</div></body></html>`;
+
+async function sendEmail({ to, subject, html }) {
+  if (!resend) { console.warn('[email] Resend not configured, skipping:', subject); return; }
+  try {
+    await resend.emails.send({ from: `DegenDrip <${FROM_EMAIL}>`, to, subject, html });
+    console.log(`[email] Sent "${subject}" → ${to}`);
+  } catch (e) { console.error('[email] Failed:', subject, e.message); }
+}
+
+function sendOrderReceived(order) {
+  return sendEmail({
+    to: order.customerEmail,
+    subject: 'Your DegenDrip order is in review',
+    html: emailWrap(`
+      <h2 style="font-size:20px;color:#fff;margin:0 0 12px">Order received ✓</h2>
+      <p style="color:#aaa;line-height:1.6;margin:0 0 16px">Thanks for your order! We review every order before production to make sure it prints cleanly. Review usually takes under 24 hours.</p>
+      <p style="color:#aaa;line-height:1.6;margin:0 0 24px">You'll get another email once it's approved and in production.</p>
+      <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Order ID</div>
+        <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(order.orderId)}</div>
+      </div>`),
+  });
+}
+
+function sendOrderInProduction(order) {
+  return sendEmail({
+    to: order.customerEmail,
+    subject: 'Your DegenDrip order is being made',
+    html: emailWrap(`
+      <h2 style="font-size:20px;color:#44ff88;margin:0 0 12px">Order approved 🎉</h2>
+      <p style="color:#aaa;line-height:1.6;margin:0 0 24px">Good news — your order is approved and now in production. We'll email you tracking info once it ships.</p>
+      <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Order ID</div>
+        <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(order.orderId)}</div>
+      </div>`),
+  });
+}
+
+function sendOrderRejected(order) {
+  return sendEmail({
+    to: order.customerEmail,
+    subject: 'Your DegenDrip order was refunded',
+    html: emailWrap(`
+      <h2 style="font-size:20px;color:#ff6666;margin:0 0 12px">Order refunded</h2>
+      <p style="color:#aaa;line-height:1.6;margin:0 0 16px">We weren't able to fulfill your order.</p>
+      <div style="background:#2a1414;border:1px solid #4a2020;border-radius:8px;padding:16px;margin-bottom:20px">
+        <div style="font-size:11px;color:#776060;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Reason</div>
+        <div style="color:#ffaaaa;line-height:1.5">${escHtml(order.rejectionReason || 'Order could not be fulfilled')}</div>
+      </div>
+      <p style="color:#aaa;line-height:1.6;margin:0 0 24px">Your payment has been fully refunded and should appear in 5–10 business days.</p>
+      <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Order ID</div>
+        <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(order.orderId)}</div>
+      </div>`),
+  });
+}
+
+function sendOrderShipped(order, trackingUrl, carrier) {
+  return sendEmail({
+    to: order.customerEmail,
+    subject: 'Your DegenDrip order has shipped',
+    html: emailWrap(`
+      <h2 style="font-size:20px;color:#fff;margin:0 0 12px">Your order is on the way 📦</h2>
+      <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:20px">
+        ${trackingUrl ? `<div style="margin-bottom:16px">
+          <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Tracking</div>
+          <a href="${escHtml(trackingUrl)}" style="color:#60b0ff;word-break:break-all;font-size:14px">${escHtml(trackingUrl)}</a>
+        </div>` : ''}
+        ${carrier ? `<div style="margin-bottom:16px">
+          <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Carrier</div>
+          <div style="color:#ddd;font-size:14px">${escHtml(carrier)}</div>
+        </div>` : ''}
+        <div>
+          <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Order ID</div>
+          <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(order.orderId)}</div>
+        </div>
+      </div>`),
+  });
 }
 
 // ─── Disk-backed mockup cache ─────────────────────────────────────────────────
@@ -118,8 +263,6 @@ async function getCatalogProductPhoto(catalogProductId, pfHeaders) {
 }
 
 // Wrap an image URL through wsrv.nl so Printful can fetch it (follows redirects, converts WebP→PNG).
-// If already a wsrv.nl URL, extract the inner source URL and re-wrap with our standard params so
-// the final URL is always properly encoded (raw wsrv.nl URLs from the frontend aren't encoded).
 function proxyImageUrl(url) {
   if (url.startsWith('https://wsrv.nl/') || url.startsWith('http://wsrv.nl/')) {
     try {
@@ -130,8 +273,7 @@ function proxyImageUrl(url) {
   return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=png&w=1800`;
 }
 
-// Fetch, compute and cache everything needed for a product's print area:
-// catalog IDs, print dimensions, placement name, and template overlay coords.
+// Fetch, compute and cache everything needed for a product's print area.
 async function getProductPrintInfo(productKey, pfHeaders, color, size) {
   const cacheKey = `${productKey}:${color || ''}:${size || ''}`;
   if (printAreaInfoCache.has(cacheKey)) return printAreaInfoCache.get(cacheKey);
@@ -139,7 +281,6 @@ async function getProductPrintInfo(productKey, pfHeaders, color, size) {
   let syncVariantId;
   if (color) {
     const variantMap = buildVariantMap()[productKey] || {};
-    // Try exact size|color match first, then any color match
     const exactMatch = size ? Object.entries(variantMap).find(([k]) => k === `${size}|${color}`) : null;
     const colorMatch = Object.entries(variantMap).find(([k]) => k.split('|')[1] === color);
     syncVariantId = exactMatch?.[1] ?? colorMatch?.[1] ?? REPRESENTATIVE_SYNC_VARIANTS[productKey]?.();
@@ -148,19 +289,17 @@ async function getProductPrintInfo(productKey, pfHeaders, color, size) {
   }
   if (!syncVariantId) throw new Error(`No sync variant configured for: ${productKey}${color ? ` (${color})` : ''}`);
 
-  // Resolve catalog variant + product IDs
   const svRes  = await fetch(`https://api.printful.com/sync/variant/${syncVariantId}`, { headers: pfHeaders });
   const svData = await svRes.json();
   if (!svRes.ok) throw new Error(`Sync variant lookup failed: ${svData.error?.message}`);
 
-  const catalogVariantId = svData.result.sync_variant.variant_id;
-  const catalogProductId = svData.result.sync_variant.product.product_id;
-  const svFiles = svData.result.sync_variant.files ?? [];
+  const catalogVariantId  = svData.result.sync_variant.variant_id;
+  const catalogProductId  = svData.result.sync_variant.product.product_id;
+  const svFiles           = svData.result.sync_variant.files ?? [];
   const variantPreviewUrl = svFiles.find(f => f.type === 'preview')?.preview_url
                          ?? svFiles[0]?.preview_url
                          ?? null;
 
-  // Get printfile dimensions (the actual print area in pixels)
   const pfRes  = await fetch(`https://api.printful.com/mockup-generator/printfiles/${catalogProductId}`, { headers: pfHeaders });
   const pfData = await pfRes.json();
 
@@ -170,26 +309,22 @@ async function getProductPrintInfo(productKey, pfHeaders, color, size) {
     if (variantPf.front_large) placementName = 'front_large';
     else if (Object.keys(variantPf).length > 0) placementName = Object.keys(variantPf)[0];
   }
-  const pfId     = variantPf[placementName];
+  const pfId      = variantPf[placementName];
   const printfile = pfData.result?.printfiles?.find(p => p.printfile_id === pfId)
                  ?? pfData.result?.printfiles?.[0];
   const area_width  = printfile?.width  ?? 1800;
   const area_height = printfile?.height ?? 2400;
 
-  // Get template overlay coordinates (where the print area sits on the product photo)
   let template = null;
   try {
     const tmRes  = await fetch(`https://api.printful.com/mockup-generator/templates/${catalogProductId}`, { headers: pfHeaders });
     const tmData = await tmRes.json();
-
-    // Find the template for our variant; fall back to first available
     const variantMapping = tmData.result?.variant_mapping ?? [];
     const variantMap     = variantMapping.find(v => v.variant_id === catalogVariantId);
     const templateId     = variantMap?.templates?.[0]?.template_id
                         ?? tmData.result?.templates?.[0]?.template_id;
     const tmpl           = tmData.result?.templates?.find(t => t.template_id === templateId)
                         ?? tmData.result?.templates?.[0];
-
     if (tmpl) {
       template = {
         imageUrl:        tmpl.image_url,
@@ -203,10 +338,8 @@ async function getProductPrintInfo(productKey, pfHeaders, color, size) {
     }
   } catch {}
 
-  // Always fetch catalog product photo — used as canvas background (cleaner than template overlay images)
   const catalogPhotoUrl = await getCatalogProductPhoto(catalogProductId, pfHeaders);
 
-  // If template API returned nothing usable, synthesize a full-area template from the catalog photo
   if (!template || !template.imageUrl) {
     template = {
       imageUrl:        catalogPhotoUrl || '',
@@ -226,7 +359,6 @@ async function getProductPrintInfo(productKey, pfHeaders, color, size) {
   return info;
 }
 
-// Representative sync variant per product — used for mockup catalog ID resolution.
 const REPRESENTATIVE_SYNC_VARIANTS = {
   tshirt:              () => process.env.PRINTFUL_TSHIRT_WHITE_M,
   hoodie:              () => process.env.PRINTFUL_HOODIE_WHITE_M,
@@ -241,7 +373,6 @@ const REPRESENTATIVE_SYNC_VARIANTS = {
   'phonecase-samsung': () => process.env.PRINTFUL_SAMSUNGCASE_S24,
 };
 
-// ─── Variant lookup ───────────────────────────────────────────────────────────
 function buildVariantMap() {
   const e = process.env;
   return {
@@ -353,20 +484,15 @@ app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html'))
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // ─── Image proxy ─────────────────────────────────────────────────────────────
-// Fetches a remote image (logo/banner from DexScreener), detects animated GIF
-// or animated WebP, converts to a static PNG of frame 1 using sharp, caches
-// the result in Redis (24h), and returns PNG bytes.
-// Sets x-converted-from: gif|webp when conversion happened.
 const sharp = require('sharp');
 
 app.get('/api/proxy-image', async (req, res) => {
   const url = req.query.url;
   if (!url || !url.startsWith('http')) return res.status(400).json({ error: 'Missing or invalid url' });
 
-  const cacheKey  = `imgproxy:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
-  const metaKey   = `${cacheKey}:cf`;
+  const cacheKey = `imgproxy:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+  const metaKey  = `${cacheKey}:cf`;
 
-  // Serve from Redis cache
   if (redis) {
     try {
       const [cachedB64, convertedFrom] = await Promise.all([
@@ -380,55 +506,42 @@ app.get('/api/proxy-image', async (req, res) => {
         if (convertedFrom) res.setHeader('x-converted-from', convertedFrom);
         return res.send(buf);
       }
-    } catch (e) {
-      console.warn('[proxy-image] Redis read error:', e.message);
-    }
+    } catch (e) { console.warn('[proxy-image] Redis read error:', e.message); }
   }
 
-  // Fetch original
-  let origBuffer, fetchContentType;
+  let origBuffer;
   try {
     const origRes = await fetch(url, { timeout: 15000 });
     if (!origRes.ok) return res.status(502).json({ error: `Upstream ${origRes.status} for ${url}` });
     origBuffer = await origRes.buffer();
-    fetchContentType = origRes.headers.get('content-type') || '';
   } catch (e) {
     return res.status(502).json({ error: `Fetch failed: ${e.message}` });
   }
 
-  // Detect animated GIF: magic bytes GIF87a / GIF89a
-  const sig = origBuffer.slice(0, 6).toString('binary');
-  const isGif = sig.startsWith('GIF87a') || sig.startsWith('GIF89a');
-
-  // Detect animated WebP: RIFF????WEBP header + ANIM chunk present
-  const isWebpContainer = sig.slice(0, 4) === 'RIFF' &&
-    origBuffer.length > 12 && origBuffer.slice(8, 12).toString('binary') === 'WEBP';
-  const isAnimWebp = isWebpContainer && origBuffer.indexOf(Buffer.from('ANIM')) !== -1;
+  const sig          = origBuffer.slice(0, 6).toString('binary');
+  const isGif        = sig.startsWith('GIF87a') || sig.startsWith('GIF89a');
+  const isWebpCont   = sig.slice(0, 4) === 'RIFF' && origBuffer.length > 12 && origBuffer.slice(8, 12).toString('binary') === 'WEBP';
+  const isAnimWebp   = isWebpCont && origBuffer.indexOf(Buffer.from('ANIM')) !== -1;
 
   let outBuffer, convertedFrom = null;
   try {
     if (isGif || isAnimWebp) {
-      // Extract frame 1 only
-      outBuffer = await sharp(origBuffer, { animated: false }).png().toBuffer();
+      outBuffer    = await sharp(origBuffer, { animated: false }).png().toBuffer();
       convertedFrom = isGif ? 'gif' : 'webp';
       console.log(`[proxy-image] Converted animated ${convertedFrom} → PNG: ${url.slice(0, 80)}`);
     } else {
-      // Normalise to PNG for consistency (handles JPEG, static GIF, WebP, etc.)
       outBuffer = await sharp(origBuffer).png().toBuffer();
     }
   } catch (e) {
-    console.warn('[proxy-image] sharp failed, serving raw bytes:', e.message);
+    console.warn('[proxy-image] sharp failed, serving raw:', e.message);
     outBuffer = origBuffer;
   }
 
-  // Cache in Redis
   if (redis) {
     try {
       await redis.setex(cacheKey, 86400, outBuffer.toString('base64'));
       if (convertedFrom) await redis.setex(metaKey, 86400, convertedFrom);
-    } catch (e) {
-      console.warn('[proxy-image] Redis write error:', e.message);
-    }
+    } catch (e) { console.warn('[proxy-image] Redis write error:', e.message); }
   }
 
   res.setHeader('Content-Type', 'image/png');
@@ -441,12 +554,11 @@ app.get('/api/proxy-image', async (req, res) => {
 app.post('/api/check-text', (req, res) => {
   const { text } = req.body;
   if (typeof text !== 'string') return res.status(400).json({ error: 'Missing text' });
-  const result = checkText(text);
-  res.json(result);
+  res.json(checkText(text));
 });
 
 // ─── Stock status ─────────────────────────────────────────────────────────────
-const stockCache = new Map(); // productKey -> { data, expiresAt }
+const stockCache = new Map();
 const STOCK_CACHE_TTL = 5 * 60 * 1000;
 
 app.get('/api/stock/:productKey', async (req, res) => {
@@ -469,20 +581,16 @@ app.get('/api/stock/:productKey', async (req, res) => {
     const variants = prodData.result?.sync_variants || [];
 
     const variantMap = buildVariantMap()[productKey] || {};
-    const ourSizes = new Set(Object.keys(variantMap).map(k => k.includes('|') ? k.split('|')[0] : k));
-    // Case-insensitive lookup: Printful may return "One size" while our keys use "One Size"
+    const ourSizes   = new Set(Object.keys(variantMap).map(k => k.includes('|') ? k.split('|')[0] : k));
     const normSizeMap = new Map([...ourSizes].map(s => [s.toLowerCase(), s]));
 
-    // Per-size: available if ANY color variant for it is active
-    // Per-color: tracked independently so color buttons can be marked OOS
-    const sizeStatusMap = {};
+    const sizeStatusMap  = {};
     const colorStatusMap = {};
     for (const v of variants) {
       const pfSize  = v.size  || '';
       const color   = v.color || '';
       const status  = v.availability_status;
       const ourSize = normSizeMap.get(pfSize.toLowerCase());
-
       if (ourSize) {
         if (!sizeStatusMap[ourSize] || status === 'active') sizeStatusMap[ourSize] = status;
       }
@@ -516,17 +624,16 @@ app.get('/api/color', async (req, res) => {
       Jimp.intToRGBA(image.getPixelColor(0, h)), Jimp.intToRGBA(image.getPixelColor(w, h)),
     ].filter(c => c.a > 20);
     if (!corners.length) return res.json({ color: '#ffffff' });
-    const r = Math.round(corners.reduce((s,c) => s+c.r, 0) / corners.length);
-    const g = Math.round(corners.reduce((s,c) => s+c.g, 0) / corners.length);
-    const b = Math.round(corners.reduce((s,c) => s+c.b, 0) / corners.length);
-    res.json({ color: '#' + [r,g,b].map(x => x.toString(16).padStart(2,'0')).join('') });
-  } catch (err) {
+    const r = Math.round(corners.reduce((s, c) => s + c.r, 0) / corners.length);
+    const g = Math.round(corners.reduce((s, c) => s + c.g, 0) / corners.length);
+    const b = Math.round(corners.reduce((s, c) => s + c.b, 0) / corners.length);
+    res.json({ color: '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('') });
+  } catch {
     res.json({ color: '#ffffff' });
   }
 });
 
 // ─── PRINT AREA INFO ──────────────────────────────────────────────────────────
-// Returns catalog IDs, print dimensions, placement name, and template overlay data.
 app.get('/api/printarea/:productKey', async (req, res) => {
   const { productKey } = req.params;
   const color = req.query.color || null;
@@ -569,16 +676,13 @@ app.get('/api/productphoto/:catalogProductId', async (req, res) => {
 });
 
 // ─── TEMP IMAGE STORE ────────────────────────────────────────────────────────
-// Content-addressable: keyed by sha256 of image bytes.
-// Same pixel content → same hash → same URL → mockup cache hits.
-const tempImageStore = new Map(); // contentHash → { buffer, created, designUrl? }
+const tempImageStore = new Map();
 setInterval(() => {
   const cutoff = Date.now() - 15 * 60 * 1000;
   for (const [hash, entry] of tempImageStore)
     if (entry.created < cutoff) tempImageStore.delete(hash);
 }, 60_000);
 
-// Serve a temporarily stored image (Printful fetches this during file upload)
 app.get('/api/tmp/:uuid', (req, res) => {
   const entry = tempImageStore.get(req.params.uuid);
   if (!entry) return res.status(404).send('Not found');
@@ -587,49 +691,36 @@ app.get('/api/tmp/:uuid', (req, res) => {
   res.send(entry.buffer);
 });
 
-// POST /api/upload-design
-// Body: { base64: "data:image/png;base64,..." }
-// Stores the image, gives Printful a URL to fetch it, returns a Printful CDN URL.
-// Requires BACKEND_URL env var so Printful can reach /api/tmp/:uuid.
 app.post('/api/upload-design', async (req, res) => {
   const { base64 } = req.body;
   if (!base64) return res.status(400).json({ error: 'Missing base64' });
 
   try {
-    const b64 = base64.replace(/^data:image\/\w+;base64,/, '');
-    const buffer = Buffer.from(b64, 'base64');
+    const b64          = base64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer       = Buffer.from(b64, 'base64');
+    const contentHash  = createHash('sha256').update(buffer).digest('hex');
 
-    // Content-addressable key: sha256 of raw image bytes.
-    // Same composite (same logo position + text + colors) → same hash → same URL → mockup cache hits.
-    const { createHash } = require('crypto');
-    const contentHash = createHash('sha256').update(buffer).digest('hex');
-
-    // If we've already processed this exact image, return the cached designUrl immediately.
     const existing = tempImageStore.get(contentHash);
     if (existing?.designUrl) {
       console.log(`[upload-design] CACHE HIT hash=${contentHash.slice(0,12)}… — reusing ${existing.designUrl}`);
       return res.json({ designUrl: existing.designUrl, contentHash });
     }
 
-    // Store buffer (or refresh TTL for an entry without a designUrl yet)
     tempImageStore.set(contentHash, { buffer, created: Date.now(), designUrl: null });
     console.log(`[upload-design] New image ${(buffer.length / 1024).toFixed(0)} KB → hash=${contentHash.slice(0,12)}…`);
 
-    // Auto-detect Railway public URL so BACKEND_URL doesn't need to be set manually
     const backendUrl = (
       process.env.BACKEND_URL ||
       (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
     ).replace(/\/$/, '');
     if (!backendUrl) {
-      console.warn('[upload-design] BACKEND_URL not set and RAILWAY_PUBLIC_DOMAIN not available — cannot make image public for Printful');
+      console.warn('[upload-design] BACKEND_URL not set — cannot make image public for Printful');
       return res.json({ designUrl: null });
     }
 
     const tempUrl = `${backendUrl}/api/tmp/${contentHash}`;
-
     if (!process.env.PRINTFUL_API_KEY) return res.json({ designUrl: tempUrl, contentHash });
 
-    // Upload to Printful file library → permanent CDN URL
     const pfHeaders = {
       'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
       'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
@@ -644,8 +735,6 @@ app.post('/api/upload-design', async (req, res) => {
     console.log(`[upload-design] Printful /files HTTP ${uploadRes.status}:`, JSON.stringify(uploadData));
 
     const designUrl = uploadData.result?.url || tempUrl;
-
-    // Cache the resolved CDN URL so future uploads of the same bytes skip Printful entirely
     const entry = tempImageStore.get(contentHash);
     if (entry) entry.designUrl = designUrl;
 
@@ -657,11 +746,6 @@ app.post('/api/upload-design', async (req, res) => {
 });
 
 // ─── MOCKUP GENERATION ────────────────────────────────────────────────────────
-// POST /api/mockup
-// Body: { productKey, imageUrl, contentHash?, color, size, position: { xPct, yPct, wPct, hPct } }
-//   contentHash (optional): sha256 of composited image bytes — used as cache key instead of imageUrl
-//   xPct/yPct = top-left corner as fraction of print area (0–1)
-//   wPct/hPct = logo size as fraction of print area (0–1)
 app.post('/api/mockup', async (req, res) => {
   const { productKey, imageUrl, position, color, size, contentHash } = req.body;
   if (!productKey || !imageUrl)
@@ -669,12 +753,9 @@ app.post('/api/mockup', async (req, res) => {
   if (!process.env.PRINTFUL_API_KEY)
     return res.status(503).json({ error: 'Printful API key not configured' });
 
-  // Default: logo centered at 50% width
   const pos = position || { xPct: 0.25, yPct: 0.25, wPct: 0.50, hPct: 0.50 };
   const sig = [pos.xPct, pos.yPct, pos.wPct, pos.hPct].map(v => Math.round(v * 1000)).join('_');
-  // Use content hash when available (composite uploads) — URL changes each run, hash is stable.
-  // v3 prefix busts old v2 entries that used the URL.
-  const imgKey = contentHash || imageUrl;
+  const imgKey   = contentHash || imageUrl;
   const cacheKey = `v3:${productKey}:${color || ''}:${size || ''}:${imgKey}:${sig}`;
 
   if (mockupCache.has(cacheKey)) {
@@ -692,30 +773,28 @@ app.post('/api/mockup', async (req, res) => {
     const { catalogProductId, catalogVariantId, placementName, area_width, area_height }
       = await getProductPrintInfo(productKey, pfHeaders, color, size);
 
-    // Convert fractions → pixels, clamped strictly inside print area
     const imgW = Math.max(1, Math.min(area_width,  Math.round(area_width  * pos.wPct)));
     const imgH = Math.max(1, Math.min(area_height, Math.round(area_height * pos.hPct)));
     const left = Math.max(0, Math.min(area_width  - imgW, Math.round(area_width  * pos.xPct)));
     const top  = Math.max(0, Math.min(area_height - imgH, Math.round(area_height * pos.yPct)));
 
     const pfPosition = { area_width, area_height, width: imgW, height: imgH, top, left };
-    const proxied = proxyImageUrl(imageUrl);
+    const proxied    = proxyImageUrl(imageUrl);
 
     console.log(`\n[Mockup] ${productKey} — create-task request:`);
     console.log(`  catalogProductId: ${catalogProductId}  variantId: ${catalogVariantId}  placement: ${placementName}`);
     console.log(`  print area: ${area_width}×${area_height}  logo: ${imgW}×${imgH} at (${left},${top})`);
     console.log(`  image_url: ${proxied}`);
 
-    // Pins: fill all 5 placements so every pin shows the design
     const PIN_PLACEMENTS = ['front', 'first', 'second', 'third', 'fourth'];
     const taskFiles = productKey === 'pins'
       ? PIN_PLACEMENTS.map(p => ({ placement: p, image_url: proxied, position: pfPosition }))
       : [{ placement: placementName, image_url: proxied, position: pfPosition }];
 
     const taskBody = {
-      variant_ids:   [catalogVariantId],
-      files:         taskFiles,
-      format:        'jpg',
+      variant_ids: [catalogVariantId],
+      files:       taskFiles,
+      format:      'jpg',
       ...(productKey === 'pins' ? { option_groups: ['Flat'] } : {}),
     };
 
@@ -728,7 +807,7 @@ app.post('/api/mockup', async (req, res) => {
     console.log(`[Mockup] ${productKey} — create-task HTTP ${taskRes.status}:`, JSON.stringify(taskData));
 
     if (!taskRes.ok) {
-      const errMsg = taskData.error?.message || JSON.stringify(taskData);
+      const errMsg     = taskData.error?.message || JSON.stringify(taskData);
       const retryMatch = errMsg.match(/try again after (\d+) seconds?/i);
       if (retryMatch || taskRes.status === 429) {
         const retryAfter = retryMatch ? parseInt(retryMatch[1]) : 60;
@@ -749,24 +828,19 @@ app.post('/api/mockup', async (req, res) => {
         { headers: pfHeaders },
       );
       const pollData = await pollRes.json();
-      const status = pollData.result?.status;
+      const status   = pollData.result?.status;
       console.log(`[Mockup] ${productKey} — poll ${i+1}: status=${status}`);
       if (status === 'completed') {
         const primary = pollData.result.mockups?.[0];
         if (productKey === 'mug' && primary?.extra?.length > 0) {
-          console.log(`[Mockup] mug extra views:`, JSON.stringify(primary.extra.map(e => ({ title: e.title, option: e.option, option_group: e.option_group }))));
           const front = primary.extra.find(e => /front/i.test(e.title || '') || /front/i.test(e.option || ''));
-          mockupUrl = front?.url ?? primary.mockup_url;
-          console.log(`[Mockup] mug — selected ${front ? `extra "${front.title}"` : 'primary (no front extra found)'}: ${mockupUrl}`);
+          mockupUrl   = front?.url ?? primary.mockup_url;
         } else {
           mockupUrl = primary?.mockup_url;
         }
         break;
       }
-      if (status === 'failed') {
-        console.error(`[Mockup] ${productKey} — poll failed response:`, JSON.stringify(pollData));
-        throw new Error('Printful mockup generation failed');
-      }
+      if (status === 'failed') throw new Error('Printful mockup generation failed');
     }
 
     if (!mockupUrl) throw new Error('Mockup generation timed out');
@@ -782,14 +856,13 @@ app.post('/api/mockup', async (req, res) => {
 });
 
 // ─── SHIPPING HELPERS ────────────────────────────────────────────────────────
-// Non-CONUS US states/territories that Printful treats as international shipping
 const NON_CONUS = new Set(['AK','HI','PR','GU','VI','AS','MP','UM']);
 
 function isCONUS(country, state) {
   return country === 'US' && !NON_CONUS.has((state || '').toUpperCase().trim());
 }
 
-const shippingRateCache = new Map(); // cacheKey → { rates, expiresAt }
+const shippingRateCache = new Map();
 
 async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
   const pfItems = cartItems.flatMap(item => {
@@ -798,9 +871,9 @@ async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
   });
   if (pfItems.length === 0) return [];
 
-  const body = { recipient, items: pfItems, currency: 'USD', locale: 'en_US' };
+  const body     = { recipient, items: pfItems, currency: 'USD', locale: 'en_US' };
   const cacheKey = JSON.stringify(body);
-  const cached = shippingRateCache.get(cacheKey);
+  const cached   = shippingRateCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) {
     console.log('[shipping] cache hit');
     return cached.rates;
@@ -824,14 +897,12 @@ function cheapestRate(rates) {
   return rates.reduce((a, b) => parseFloat(a.rate) <= parseFloat(b.rate) ? a : b, rates[0]);
 }
 
-// We absorb the first $5 of international shipping; customer pays only the excess
 const SHIPPING_BASELINE = 5.00;
 function customerShippingCost(printfulRate) {
   return Math.max(0, parseFloat(printfulRate) - SHIPPING_BASELINE);
 }
 
 // ─── PRODUCTION COST LOOKUP ──────────────────────────────────────────────────
-// syncVariantId → { cost, expiresAt } — 24h TTL (prices rarely change)
 const productionCostCache = new Map();
 
 async function getProductionCost(syncVariantId, pfHeaders) {
@@ -891,8 +962,7 @@ app.post('/api/checkout', async (req, res) => {
   const { cart, shipping, tokenName, tokenSym } = req.body;
   if (!cart || cart.length === 0) return res.status(400).json({ error: 'Empty cart' });
 
-  // ── Content moderation ─────────────────────────────────────────────────────
-  const modFlags = checkCart(cart);
+  const modFlags    = checkCart(cart);
   const hardBlocked = modFlags.filter(f => f.result === 'blocked');
   if (hardBlocked.length > 0) {
     console.warn('[checkout] HARD BLOCK — flagged text:', hardBlocked.map(f => `"${f.text}" (${f.category})`).join(', '));
@@ -902,14 +972,13 @@ app.post('/api/checkout', async (req, res) => {
   if (needsReview.length > 0) {
     console.warn('[checkout] SOFT REVIEW — flagged text:', needsReview.map(f => `"${f.text}" (${f.category})`).join(', '));
   }
-  // ──────────────────────────────────────────────────────────────────────────
 
   try {
     const lineItems = cart.map(item => ({
       price_data: {
-        currency: 'usd',
+        currency:     'usd',
         product_data: {
-          name: `${item.name} — $${tokenSym} ${tokenName}`,
+          name:        `${item.name} — $${tokenSym} ${tokenName}`,
           description: `Size: ${item.size}${item.color ? ` / ${item.color}` : ''}`,
         },
         unit_amount: Math.round(item.price * 100),
@@ -929,28 +998,24 @@ app.post('/api/checkout', async (req, res) => {
       zip:          shipping.zip   || '',
     };
 
-    // Always fetch raw Printful shipping rate — used for both customer charge and profit calc
-    let rawPrintfulShipping = 0;
-    let shippingLabel = 'Free shipping';
-    let shippingCost = 0; // what customer actually pays
+    let rawPrintfulShipping = 0, shippingLabel = 'Free shipping', shippingCost = 0;
     try {
       const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
       if (rates.length) {
-        const best = cheapestRate(rates);
+        const best          = cheapestRate(rates);
         rawPrintfulShipping = parseFloat(best.rate);
-        shippingLabel = best.name;
-        shippingCost = isCONUS(shipping.country, shipping.state)
+        shippingLabel       = best.name;
+        shippingCost        = isCONUS(shipping.country, shipping.state)
           ? 0
           : customerShippingCost(rawPrintfulShipping);
       }
     } catch (e) {
       console.warn('[checkout] Could not fetch shipping rate:', e.message);
-      rawPrintfulShipping = isCONUS(shipping.country, shipping.state) ? 5 : 12; // conservative estimate
-      shippingCost = isCONUS(shipping.country, shipping.state) ? 0 : Math.max(0, rawPrintfulShipping - SHIPPING_BASELINE);
-      shippingLabel = 'Shipping & handling';
+      rawPrintfulShipping = isCONUS(shipping.country, shipping.state) ? 5 : 12;
+      shippingCost        = isCONUS(shipping.country, shipping.state) ? 0 : Math.max(0, rawPrintfulShipping - SHIPPING_BASELINE);
+      shippingLabel       = 'Shipping & handling';
     }
 
-    // Fetch production cost per item (cached 24h) and run profit guard
     const customerRevenue = cart.reduce((s, i) => s + i.price * (i.qty || 1), 0) + shippingCost;
     let totalProductionCost = 0;
     for (const item of cart) {
@@ -964,14 +1029,13 @@ app.post('/api/checkout', async (req, res) => {
         }
       }
     }
-    const profit = customerRevenue - totalProductionCost - rawPrintfulShipping;
+    const profit    = customerRevenue - totalProductionCost - rawPrintfulShipping;
     const MIN_PROFIT = 2.00;
     if (profit < MIN_PROFIT) {
       console.warn(
         `[checkout] BLOCKED low-profit order — profit=$${profit.toFixed(2)} ` +
         `revenue=$${customerRevenue.toFixed(2)} pf_prod=$${totalProductionCost.toFixed(2)} ` +
-        `pf_ship=$${rawPrintfulShipping.toFixed(2)} ` +
-        `country=${shipping.country} state=${shipping.state || ''} ` +
+        `pf_ship=$${rawPrintfulShipping.toFixed(2)} country=${shipping.country} state=${shipping.state || ''} ` +
         `cart=${JSON.stringify(cart.map(i => ({ pid: i.pid, size: i.size, qty: i.qty, price: i.price })))}`
       );
       return res.status(422).json({
@@ -987,11 +1051,8 @@ app.post('/api/checkout', async (req, res) => {
       });
     }
 
-    // Store full order data in Redis (TTL 24h) — webhook fetches by orderId.
-    // This keeps Stripe metadata well under the 500-char-per-value limit.
-    const orderId = `order_${randomBytes(8).toString('hex')}`;
-    // Strip thumbnailUrl (large data URL) — not needed for fulfillment
-    const cartForStore = cart.map(({ thumbnailUrl: _t, ...rest }) => rest);
+    const orderId       = `order_${randomBytes(8).toString('hex')}`;
+    const cartForStore  = cart.map(({ thumbnailUrl: _t, ...rest }) => rest);
     await orderStoreSet(orderId, {
       cart:            cartForStore,
       shipping,
@@ -1004,10 +1065,10 @@ app.post('/api/checkout', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
-      line_items:  lineItems,
-      mode:        'payment',
-      success_url: `${process.env.FRONTEND_URL}?order=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${process.env.FRONTEND_URL}?order=cancelled`,
+      line_items:   lineItems,
+      mode:         'payment',
+      success_url:  `${process.env.FRONTEND_URL}?order=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url:   `${process.env.FRONTEND_URL}?order=cancelled`,
       customer_email: shipping.email,
       metadata: {
         order_id:      orderId,
@@ -1044,17 +1105,14 @@ app.post('/api/webhook', async (req, res) => {
 async function handleCompletedSession(session) {
   const orderId = session.metadata?.order_id;
 
-  // Fetch full order data from Redis; fall back to legacy metadata format
   let orderData = orderId ? await orderStoreGet(orderId) : null;
   if (!orderData) {
-    // Backwards-compat: sessions created before this change stored cart in metadata
     console.warn('[webhook] orderStore miss for', orderId, '— falling back to metadata');
     let cart = [], shipping = {};
     try { cart     = JSON.parse(session.metadata.cart     || '[]'); } catch {}
     try { shipping = JSON.parse(session.metadata.shipping || '{}'); } catch {}
     orderData = {
-      cart,
-      shipping,
+      cart, shipping,
       tokenName:       session.metadata.token_name    || '',
       tokenSym:        session.metadata.token_sym     || '',
       shippingCost:    parseFloat(session.metadata.shipping_cost || '0'),
@@ -1064,8 +1122,8 @@ async function handleCompletedSession(session) {
 
   const { cart, shipping, tokenName, tokenSym, shippingCost, moderationFlags = [] } = orderData;
 
-  // Belt-and-suspenders hard-block re-check
-  const liveFlags  = checkCart(cart);
+  // Belt-and-suspenders hard-block re-check; auto-refund if triggered
+  const liveFlags   = checkCart(cart);
   const hardBlocked = liveFlags.filter(f => f.result === 'blocked');
   if (hardBlocked.length > 0) {
     console.error('[webhook] HARD BLOCK — auto-refunding session', session.id);
@@ -1081,83 +1139,181 @@ async function handleCompletedSession(session) {
     ? moderationFlags
     : liveFlags.filter(f => f.result === 'review');
 
-  if (reviewFlags.length > 0) {
-    // Soft review: hold for admin
-    const pendingId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const order = {
-      id:                  pendingId,
-      stripeSessionId:     session.id,
-      stripePaymentIntent: session.payment_intent || null,
-      cart, shipping, tokenName, tokenSym, shippingCost,
-      moderationFlags: reviewFlags,
-      status:    'pending',
-      createdAt: new Date().toISOString(),
-    };
-    pendingOrders.set(pendingId, order);
-    savePendingOrders();
-    if (orderId) await orderStoreDel(orderId);
-    console.warn(`[webhook] Order HELD — ${pendingId} — ${shipping.email} — flags: ${reviewFlags.map(f => `"${f.text}"`).join(', ')}`);
-    return;
-  }
+  // ALL orders (clean or flagged) go to manual review
+  const reviewOrderId = `ro_${randomBytes(8).toString('hex')}`;
+  const total         = cart.reduce((s, i) => s + (i.price || 0) * (i.qty || 1), 0)
+                      + (parseFloat(shippingCost) || 0);
 
-  // Clean order — send to Printful
-  await createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippingCost,
-    stripeSessionId: session.id, stripePaymentIntent: session.payment_intent });
+  const reviewOrder = {
+    orderId:               reviewOrderId,
+    customerEmail:         shipping.email || '',
+    customerName:          `${shipping.fn || ''} ${shipping.ln || ''}`.trim(),
+    items:                 cart,
+    shippingAddress:       shipping,
+    total,
+    stripeSessionId:       session.id,
+    stripePaymentIntentId: session.payment_intent || null,
+    moderationFlags:       reviewFlags,
+    status:                'pending_review',
+    createdAt:             new Date().toISOString(),
+    reviewedAt:            null,
+    rejectionReason:       null,
+    printfulOrderId:       null,
+    tokenName:             tokenName || '',
+    tokenSym:              tokenSym  || '',
+    shippingCost:          parseFloat(shippingCost) || 0,
+  };
+
+  await reviewOrderSave(reviewOrder);
   if (orderId) await orderStoreDel(orderId);
+  console.log(`[webhook] Order saved for review: ${reviewOrderId} — ${shipping.email}${reviewFlags.length ? ` — ${reviewFlags.length} flag(s)` : ''}`);
+
+  sendOrderReceived(reviewOrder).catch(e => console.error('[email]', e.message));
+
+  const backendUrl = (process.env.BACKEND_URL || process.env.FRONTEND_URL || 'https://degendrip.net').replace(/\/$/, '');
+  sendEmail({
+    to:      ADMIN_EMAIL,
+    subject: `New order needs review — ${reviewOrderId}`,
+    html:    emailWrap(`
+      <h2 style="font-size:18px;color:#fff;margin:0 0 12px">New order needs review</h2>
+      <p style="color:#aaa;margin:0 0 20px">${escHtml(reviewOrder.customerEmail)} &nbsp;·&nbsp; $${total.toFixed(2)}${reviewFlags.length ? ` &nbsp;·&nbsp; <span style="color:#ffaaaa">${reviewFlags.length} moderation flag(s)</span>` : ''}</p>
+      <a href="${backendUrl}/admin" style="display:inline-block;background:#4a7fff;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:600;font-size:14px">Review order →</a>
+      <div style="margin-top:20px;background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+        <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Order ID</div>
+        <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(reviewOrderId)}</div>
+      </div>`),
+  }).catch(e => console.error('[email admin]', e.message));
 }
 
-// ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────────
+// ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
 
-app.get('/api/admin/pending-orders', requireAdmin, (req, res) => {
-  const orders = Array.from(pendingOrders.values())
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-  res.json(orders);
+// GET /api/admin/orders?status=pending_review|in_production|rejected|shipped
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  try {
+    const orders = await reviewOrderList(req.query.status || null);
+    res.json(orders);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-app.post('/api/admin/approve-order/:id', requireAdmin, async (req, res) => {
-  const order = pendingOrders.get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.status !== 'pending') return res.status(409).json({ error: `Order is already ${order.status}` });
-
+// GET /api/admin/orders/:orderId
+app.get('/api/admin/orders/:orderId', requireAdmin, async (req, res) => {
   try {
-    const result = await createPrintfulOrder({
-      cart:            order.cart,
-      shipping:        order.shipping,
+    const order = await reviewOrderGet(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    res.json(order);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/orders/:orderId/approve → Printful → in_production → email customer
+app.post('/api/admin/orders/:orderId/approve', requireAdmin, async (req, res) => {
+  try {
+    const order = await reviewOrderGet(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'pending_review') return res.status(409).json({ error: `Order is already ${order.status}` });
+
+    const pfResult       = await createPrintfulOrder({
+      cart:            order.items,
+      shipping:        order.shippingAddress,
       tokenName:       order.tokenName,
       tokenSym:        order.tokenSym,
       shippingCost:    order.shippingCost || 0,
       stripeSessionId: order.stripeSessionId,
     });
-    order.status        = 'approved';
-    order.approvedAt    = new Date().toISOString();
-    order.printfulOrderId = result?.result?.id || null;
-    savePendingOrders();
-    console.log(`[admin] APPROVED order ${order.id} → Printful #${order.printfulOrderId}`);
-    res.json({ ok: true, printfulOrderId: order.printfulOrderId });
-  } catch (err) {
-    console.error('[admin] approve failed:', err.message);
-    res.status(500).json({ error: err.message });
+    const printfulOrderId = pfResult?.result?.id || null;
+
+    // Store Printful→review mapping so the shipping webhook can find this order
+    if (printfulOrderId && redis) {
+      redis.setex(`ro:pf:${printfulOrderId}`, REVIEW_ORDER_TTL, order.orderId)
+        .catch(e => console.error('[reviewOrder] pf mapping failed:', e.message));
+    }
+
+    const updated = await reviewOrderUpdate(req.params.orderId, {
+      status:          'in_production',
+      reviewedAt:      new Date().toISOString(),
+      printfulOrderId,
+    });
+
+    console.log(`[admin] APPROVED ${order.orderId} → Printful #${printfulOrderId}`);
+    sendOrderInProduction(updated).catch(e => console.error('[email]', e.message));
+    res.json({ ok: true, printfulOrderId });
+  } catch (e) {
+    console.error('[admin] approve failed:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
-app.post('/api/admin/reject-order/:id', requireAdmin, async (req, res) => {
-  const order = pendingOrders.get(req.params.id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (order.status !== 'pending') return res.status(409).json({ error: `Order is already ${order.status}` });
-
+// POST /api/admin/orders/:orderId/reject  body: { reason }
+app.post('/api/admin/orders/:orderId/reject', requireAdmin, async (req, res) => {
   try {
-    if (order.stripePaymentIntent) {
-      await stripe.refunds.create({ payment_intent: order.stripePaymentIntent });
-      console.log(`[admin] Refunded payment_intent ${order.stripePaymentIntent}`);
+    const order = await reviewOrderGet(req.params.orderId);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'pending_review') return res.status(409).json({ error: `Order is already ${order.status}` });
+
+    const reason = (req.body.reason || '').trim() || 'Order could not be fulfilled';
+
+    if (order.stripePaymentIntentId) {
+      await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
+      console.log(`[admin] Refunded PI ${order.stripePaymentIntentId}`);
     }
-    order.status     = 'rejected';
-    order.rejectedAt = new Date().toISOString();
-    savePendingOrders();
-    console.log(`[admin] REJECTED order ${order.id}`);
+
+    const updated = await reviewOrderUpdate(req.params.orderId, {
+      status:          'rejected',
+      reviewedAt:      new Date().toISOString(),
+      rejectionReason: reason,
+    });
+
+    console.log(`[admin] REJECTED ${order.orderId} — "${reason}"`);
+    sendOrderRejected(updated).catch(e => console.error('[email]', e.message));
     res.json({ ok: true });
-  } catch (err) {
-    console.error('[admin] reject/refund failed:', err.message);
-    res.status(500).json({ error: err.message });
+  } catch (e) {
+    console.error('[admin] reject failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── PRINTFUL SHIPPING WEBHOOK ────────────────────────────────────────────────
+// Configure in Printful dashboard → Settings → Webhooks → package_shipped
+// URL: https://degendripn-backend-production.up.railway.app/api/printful-webhook
+app.post('/api/printful-webhook', async (req, res) => {
+  res.json({ received: true }); // ack immediately
+  const event = req.body;
+  if (event.type !== 'package_shipped') return;
+  try {
+    const pfOrderId = event.data?.order?.id;
+    const shipment  = event.data?.shipment;
+    if (!pfOrderId) return;
+
+    // Look up review order by Printful order ID
+    let roId = null;
+    if (redis) roId = await redis.get(`ro:pf:${pfOrderId}`).catch(() => null);
+    if (!roId) {
+      const all   = await reviewOrderList();
+      const found = all.find(o => String(o.printfulOrderId) === String(pfOrderId));
+      if (found) roId = found.orderId;
+    }
+    if (!roId) {
+      console.warn('[printful-webhook] No review order found for PF order', pfOrderId);
+      return;
+    }
+
+    const trackingUrl = shipment?.tracking_url || null;
+    const carrier     = shipment?.carrier       || null;
+
+    const updated = await reviewOrderUpdate(roId, {
+      status:      'shipped',
+      shippedAt:   new Date().toISOString(),
+      trackingUrl,
+      carrier,
+    });
+
+    console.log(`[printful-webhook] Order ${roId} shipped — tracking: ${trackingUrl}`);
+    if (updated) sendOrderShipped(updated, trackingUrl, carrier).catch(e => console.error('[email]', e.message));
+  } catch (e) {
+    console.error('[printful-webhook] Error:', e.message);
   }
 });
 
@@ -1172,7 +1328,6 @@ async function createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippi
     const variantId = getVariantId(item.pid, item.size, item.color);
     if (!variantId) throw new Error(`No variant ID for ${item.pid}/${item.size}/${item.color}`);
 
-    // Build Printful position from saved percentage-based logo position
     let filePosition;
     if (item.logoPos && item.designUrl) {
       try {
@@ -1221,15 +1376,14 @@ async function createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippi
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 DegenDrip backend  http://localhost:${PORT}`);
-  console.log(`   Print area:  GET  /api/printarea/:productKey`);
-  console.log(`   Mockup:      POST /api/mockup`);
-  console.log(`   Upload:      POST /api/upload-design  (BACKEND_URL=${process.env.BACKEND_URL || 'not set — crop upload disabled'})`);
-  console.log(`   Checkout:    POST /api/checkout`);
-  console.log(`   Admin:       GET  /admin`);
-  console.log(`   Admin API:   GET  /api/admin/pending-orders`);
-  console.log(`   Admin API:   POST /api/admin/approve-order/:id`);
-  console.log(`   Admin API:   POST /api/admin/reject-order/:id`);
-  console.log(`   Moderation:  POST /api/check-text`);
-  console.log(`   Mockup cache: ${mockupCache.size} entries`);
-  console.log(`   Pending orders: ${pendingOrders.size} loaded\n`);
+  console.log(`   Admin:          GET  /admin`);
+  console.log(`   Admin API:      GET  /api/admin/orders[?status=...]`);
+  console.log(`   Admin API:      GET  /api/admin/orders/:id`);
+  console.log(`   Admin API:      POST /api/admin/orders/:id/approve`);
+  console.log(`   Admin API:      POST /api/admin/orders/:id/reject`);
+  console.log(`   Stripe webhook: POST /api/webhook`);
+  console.log(`   PF webhook:     POST /api/printful-webhook`);
+  console.log(`   Checkout:       POST /api/checkout`);
+  console.log(`   Mockup:         POST /api/mockup`);
+  console.log(`   Mockup cache: ${mockupCache.size} entries\n`);
 });
