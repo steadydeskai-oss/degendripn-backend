@@ -337,6 +337,7 @@ const ALLOWED_ORIGINS = [
 app.use(cors({
   origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)),
   credentials: true,
+  exposedHeaders: ['x-converted-from'],
 }));
 app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '25mb' }));
@@ -350,6 +351,91 @@ app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html'))
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ─── Image proxy ─────────────────────────────────────────────────────────────
+// Fetches a remote image (logo/banner from DexScreener), detects animated GIF
+// or animated WebP, converts to a static PNG of frame 1 using sharp, caches
+// the result in Redis (24h), and returns PNG bytes.
+// Sets x-converted-from: gif|webp when conversion happened.
+const sharp = require('sharp');
+
+app.get('/api/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url || !url.startsWith('http')) return res.status(400).json({ error: 'Missing or invalid url' });
+
+  const cacheKey  = `imgproxy:${createHash('sha256').update(url).digest('hex').slice(0, 40)}`;
+  const metaKey   = `${cacheKey}:cf`;
+
+  // Serve from Redis cache
+  if (redis) {
+    try {
+      const [cachedB64, convertedFrom] = await Promise.all([
+        redis.get(cacheKey),
+        redis.get(metaKey),
+      ]);
+      if (cachedB64) {
+        const buf = Buffer.from(cachedB64, 'base64');
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        if (convertedFrom) res.setHeader('x-converted-from', convertedFrom);
+        return res.send(buf);
+      }
+    } catch (e) {
+      console.warn('[proxy-image] Redis read error:', e.message);
+    }
+  }
+
+  // Fetch original
+  let origBuffer, fetchContentType;
+  try {
+    const origRes = await fetch(url, { timeout: 15000 });
+    if (!origRes.ok) return res.status(502).json({ error: `Upstream ${origRes.status} for ${url}` });
+    origBuffer = await origRes.buffer();
+    fetchContentType = origRes.headers.get('content-type') || '';
+  } catch (e) {
+    return res.status(502).json({ error: `Fetch failed: ${e.message}` });
+  }
+
+  // Detect animated GIF: magic bytes GIF87a / GIF89a
+  const sig = origBuffer.slice(0, 6).toString('binary');
+  const isGif = sig.startsWith('GIF87a') || sig.startsWith('GIF89a');
+
+  // Detect animated WebP: RIFF????WEBP header + ANIM chunk present
+  const isWebpContainer = sig.slice(0, 4) === 'RIFF' &&
+    origBuffer.length > 12 && origBuffer.slice(8, 12).toString('binary') === 'WEBP';
+  const isAnimWebp = isWebpContainer && origBuffer.indexOf(Buffer.from('ANIM')) !== -1;
+
+  let outBuffer, convertedFrom = null;
+  try {
+    if (isGif || isAnimWebp) {
+      // Extract frame 1 only
+      outBuffer = await sharp(origBuffer, { animated: false }).png().toBuffer();
+      convertedFrom = isGif ? 'gif' : 'webp';
+      console.log(`[proxy-image] Converted animated ${convertedFrom} → PNG: ${url.slice(0, 80)}`);
+    } else {
+      // Normalise to PNG for consistency (handles JPEG, static GIF, WebP, etc.)
+      outBuffer = await sharp(origBuffer).png().toBuffer();
+    }
+  } catch (e) {
+    console.warn('[proxy-image] sharp failed, serving raw bytes:', e.message);
+    outBuffer = origBuffer;
+  }
+
+  // Cache in Redis
+  if (redis) {
+    try {
+      await redis.setex(cacheKey, 86400, outBuffer.toString('base64'));
+      if (convertedFrom) await redis.setex(metaKey, 86400, convertedFrom);
+    } catch (e) {
+      console.warn('[proxy-image] Redis write error:', e.message);
+    }
+  }
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  if (convertedFrom) res.setHeader('x-converted-from', convertedFrom);
+  res.send(outBuffer);
+});
 
 // ─── Text moderation check ────────────────────────────────────────────────────
 app.post('/api/check-text', (req, res) => {
