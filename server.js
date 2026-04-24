@@ -1373,6 +1373,51 @@ async function createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippi
   return result;
 }
 
+// ─── PRINTFUL WEBHOOK REGISTRATION ───────────────────────────────────────────
+async function registerPrintfulWebhook() {
+  const REDIS_FLAG = 'printful:webhook:registered';
+  if (redis) {
+    try {
+      const already = await redis.get(REDIS_FLAG);
+      if (already) { console.log('[printful-webhook] Already registered (cached), skipping'); return; }
+    } catch (e) { console.warn('[printful-webhook] Redis check failed:', e.message); }
+  }
+
+  if (!process.env.PRINTFUL_API_KEY) {
+    console.warn('[printful-webhook] PRINTFUL_API_KEY not set, skipping registration');
+    return;
+  }
+
+  try {
+    const res  = await fetch('https://api.printful.com/webhooks', {
+      method:  'POST',
+      headers: {
+        Authorization:  `Bearer ${process.env.PRINTFUL_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url:   'https://degendripn-backend-production.up.railway.app/api/printful-webhook',
+        types: ['package_shipped'],
+      }),
+    });
+    const data = await res.json();
+    console.log('[printful-webhook] Registration response:', JSON.stringify(data));
+
+    const msg = data?.error?.message || '';
+    if (res.ok || /already|configured|exists/i.test(msg)) {
+      console.log(res.ok ? '[printful-webhook] Printful webhook registered' : '[printful-webhook] Printful webhook already configured');
+      if (redis) {
+        redis.setex(REDIS_FLAG, 7 * 24 * 60 * 60, '1')
+          .catch(e => console.warn('[printful-webhook] Redis flag write failed:', e.message));
+      }
+    } else {
+      console.error('[printful-webhook] Registration failed:', JSON.stringify(data));
+    }
+  } catch (e) {
+    console.error('[printful-webhook] Registration error:', e.message);
+  }
+}
+
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 DegenDrip backend  http://localhost:${PORT}`);
@@ -1386,4 +1431,5 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Checkout:       POST /api/checkout`);
   console.log(`   Mockup:         POST /api/mockup`);
   console.log(`   Mockup cache: ${mockupCache.size} entries\n`);
+  registerPrintfulWebhook().catch(e => console.error('[printful-webhook] Startup registration threw:', e.message));
 });
