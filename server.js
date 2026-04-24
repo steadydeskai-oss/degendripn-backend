@@ -1144,6 +1144,43 @@ async function handleCompletedSession(session) {
   const total         = cart.reduce((s, i) => s + (i.price || 0) * (i.qty || 1), 0)
                       + (parseFloat(shippingCost) || 0);
 
+  // ── Ghost-order guard ────────────────────────────────────────────────────────
+  // If Redis cart data expired before a delayed Stripe retry arrived, the order
+  // fields will be empty. Don't save — Stripe already has the money, so log and
+  // alert admin to investigate rather than retrying (return would already have
+  // sent 200 to Stripe from the webhook route above).
+  {
+    const missing = [];
+    if (!cart.length)                                          missing.push('cart is empty');
+    if (!shipping.email || !shipping.email.includes('@'))     missing.push('customer email');
+    if (!shipping.addr1?.trim())                              missing.push('address line 1');
+    if (!shipping.city?.trim())                               missing.push('city');
+    if (!shipping.country?.trim())                            missing.push('country');
+    if (!shipping.zip?.trim())                                missing.push('postal code');
+    if (total <= 0)                                           missing.push('total is $0');
+
+    if (missing.length > 0) {
+      console.error(`[stripe-webhook] Skipping order save — missing fields: ${missing.join(', ')} — session ${session.id}`);
+      if (orderId) await orderStoreDel(orderId);
+      sendEmail({
+        to:      ADMIN_EMAIL,
+        subject: `⚠ Ghost order blocked — Stripe session ${session.id}`,
+        html:    emailWrap(`
+          <h2 style="font-size:18px;color:#ffaaaa;margin:0 0 12px">Payment received but order data missing</h2>
+          <p style="color:#aaa;margin:0 0 16px">A completed Stripe payment had no recoverable order data. The order was <strong style="color:#fff">not saved</strong>. Please investigate and manually refund if needed.</p>
+          <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px;margin-bottom:12px">
+            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Stripe Session</div>
+            <div style="font-family:monospace;color:#ddd;font-size:13px">${escHtml(session.id)}</div>
+          </div>
+          <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Missing fields</div>
+            <div style="color:#ffaaaa;font-size:13px">${escHtml(missing.join(', '))}</div>
+          </div>`),
+      }).catch(e => console.error('[email admin ghost-order]', e.message));
+      return;
+    }
+  }
+
   const reviewOrder = {
     orderId:               reviewOrderId,
     customerEmail:         shipping.email || '',
@@ -1281,6 +1318,29 @@ app.post('/api/admin/orders/:orderId/reject', requireAdmin, async (req, res) => 
     res.json({ ok: true });
   } catch (e) {
     console.error('[admin] reject failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/admin/cleanup-ghost-orders — delete pending_review orders with no cart and $0 total
+app.post('/api/admin/cleanup-ghost-orders', requireAdmin, async (req, res) => {
+  try {
+    const orders  = await reviewOrderList('pending_review');
+    const ghosts  = orders.filter(o => (!o.items || o.items.length === 0) && (o.total || 0) === 0);
+    if (ghosts.length === 0) return res.json({ deleted: 0, message: 'No ghost orders found' });
+
+    for (const o of ghosts) {
+      if (redis) {
+        await redis.del(`ro:${o.orderId}`).catch(() => {});
+        await redis.lrem('ro:idx', 0, o.orderId).catch(() => {});
+      }
+      reviewOrderFallback.delete(o.orderId);
+      console.log(`[cleanup] Deleted ghost order ${o.orderId}`);
+    }
+    console.log(`[cleanup] Removed ${ghosts.length} ghost order(s)`);
+    res.json({ deleted: ghosts.length, ids: ghosts.map(o => o.orderId) });
+  } catch (e) {
+    console.error('[cleanup] Failed:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
