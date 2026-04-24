@@ -1256,8 +1256,18 @@ app.post('/api/admin/orders/:orderId/reject', requireAdmin, async (req, res) => 
     const reason = (req.body.reason || '').trim() || 'Order could not be fulfilled';
 
     if (order.stripePaymentIntentId) {
-      await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
-      console.log(`[admin] Refunded PI ${order.stripePaymentIntentId}`);
+      try {
+        await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
+        console.log(`[admin] Refunded PI ${order.stripePaymentIntentId}`);
+      } catch (stripeErr) {
+        const alreadyRefunded = stripeErr.code === 'charge_already_refunded'
+          || /already been refunded/i.test(stripeErr.message || '');
+        if (alreadyRefunded) {
+          console.warn(`[admin] PI ${order.stripePaymentIntentId} already refunded — treating as success`);
+        } else {
+          throw stripeErr;
+        }
+      }
     }
 
     const updated = await reviewOrderUpdate(req.params.orderId, {
