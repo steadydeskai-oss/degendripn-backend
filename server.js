@@ -1319,6 +1319,17 @@ app.post('/api/printful-webhook', async (req, res) => {
 
 // ─── PRINTFUL ORDER ───────────────────────────────────────────────────────────
 async function createPrintfulOrder({ cart, shipping, tokenName, tokenSym, shippingCost, stripeSessionId }) {
+  // Safety: reject before hitting Printful if any design URL is still local
+  for (const item of cart) {
+    const url = item.designUrl || '';
+    if (url.startsWith('blob:') || url.startsWith('data:')) {
+      throw new Error(`Order contains a local blob/data URL for item "${item.pid}" — design was not uploaded before checkout`);
+    }
+    if (/wsrv\.nl/i.test(url) && /blob%3A/i.test(url)) {
+      throw new Error(`Order contains a wsrv-wrapped blob URL for item "${item.pid}" — design was not uploaded before checkout`);
+    }
+  }
+
   const pfHeaders = {
     'Authorization': `Bearer ${process.env.PRINTFUL_API_KEY}`,
     'X-PF-Store-Id':  process.env.PRINTFUL_STORE_ID || '',
