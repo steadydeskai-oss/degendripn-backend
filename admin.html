@@ -221,15 +221,20 @@ function logout() {
 
 // ── Data ──────────────────────────────────────────────────────────────────────
 async function loadOrders() {
+  const loggedIn = document.getElementById('main-screen').style.display === 'flex';
+  const loginBtn = document.querySelector('#login-screen .btn-primary');
+  if (!loggedIn && loginBtn) { loginBtn.disabled = true; loginBtn.textContent = 'Signing in…'; }
   try {
     const res = await fetch(`${API}/api/admin/orders`, {
       headers: { Authorization: `Bearer ${password}` },
     });
     if (res.status === 401) {
-      document.getElementById('login-error').style.display = 'block';
+      const errEl = document.getElementById('login-error');
+      errEl.textContent = 'Incorrect password';
+      errEl.style.display = 'block';
       return;
     }
-    if (!res.ok) throw new Error('Server error ' + res.status);
+    if (!res.ok) throw new Error(`Server error ${res.status}`);
 
     document.getElementById('login-error').style.display = 'none';
     document.getElementById('login-screen').style.display = 'none';
@@ -241,8 +246,16 @@ async function loadOrders() {
     renderList();
     startRefreshTimer();
   } catch (e) {
-    document.getElementById('order-list').innerHTML =
-      `<div class="order-list-empty" style="color:#f87171">Error: ${esc(e.message)}</div>`;
+    if (!loggedIn) {
+      const errEl = document.getElementById('login-error');
+      errEl.textContent = `Login failed: ${e.message}`;
+      errEl.style.display = 'block';
+    } else {
+      document.getElementById('order-list').innerHTML =
+        `<div class="order-list-empty" style="color:#f87171">Error: ${esc(e.message)}</div>`;
+    }
+  } finally {
+    if (loginBtn) { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
   }
 }
 
@@ -474,7 +487,6 @@ function showRejectForm(orderId) {
 }
 
 function hideRejectForm(orderId) {
-  document.getElementById(`reject-form-${orderId}`).style.display = 'block';
   document.getElementById(`reject-form-${orderId}`).style.display = 'none';
   document.getElementById(`btn-reject-${orderId}`).style.display  = '';
 }
