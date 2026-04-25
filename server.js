@@ -864,11 +864,69 @@ function isCONUS(country, state) {
 
 const shippingRateCache = new Map();
 
+// Maps a Printful sync_variant_id (per-store) → catalog variant_id (Printful catalog).
+// /shipping/rates and /products/variant expect the catalog id; /orders expects the sync id.
+const catalogVariantIdCache = new Map();
+const CATALOG_VARIANT_REDIS_TTL = 30 * 24 * 60 * 60; // 30 days
+
+async function getCatalogVariantId(syncVariantId, pfHeaders) {
+  const sid = parseInt(syncVariantId);
+  if (!Number.isFinite(sid)) throw new Error(`Invalid sync_variant_id: ${syncVariantId}`);
+
+  const mem = catalogVariantIdCache.get(sid);
+  if (mem && Date.now() < mem.expiresAt) return mem.id;
+
+  if (redis) {
+    try {
+      const raw = await redis.get(`catalog_variant:${sid}`);
+      if (raw) {
+        const id = parseInt(raw);
+        if (Number.isFinite(id)) {
+          catalogVariantIdCache.set(sid, { id, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+          return id;
+        }
+      }
+    } catch (e) {
+      console.warn('[catalog-variant] Redis read error:', e.message);
+    }
+  }
+
+  const res  = await fetch(`https://api.printful.com/store/variants/${sid}`, { headers: pfHeaders });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Printful store/variants/${sid} lookup failed: ${data.error?.message || `HTTP ${res.status}`}`);
+  }
+  const catalogId = parseInt(data.result?.variant_id);
+  if (!Number.isFinite(catalogId)) {
+    throw new Error(`Printful store/variants/${sid} response missing variant_id`);
+  }
+
+  if (redis) {
+    try {
+      await redis.setex(`catalog_variant:${sid}`, CATALOG_VARIANT_REDIS_TTL, String(catalogId));
+    } catch (e) {
+      console.warn('[catalog-variant] Redis write error:', e.message);
+    }
+  }
+  catalogVariantIdCache.set(sid, { id: catalogId, expiresAt: Date.now() + 24 * 60 * 60 * 1000 });
+  return catalogId;
+}
+
 async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
-  const pfItems = cartItems.flatMap(item => {
-    const vid = getVariantId(item.pid, item.size, item.color);
-    return vid ? [{ quantity: item.qty || 1, variant_id: parseInt(vid) }] : [];
-  });
+  const pfItems = [];
+  for (const item of cartItems) {
+    const syncVarId = getVariantId(item.pid, item.size, item.color);
+    if (!syncVarId) continue;
+    let catalogVarId;
+    try {
+      catalogVarId = await getCatalogVariantId(syncVarId, pfHeaders);
+    } catch (e) {
+      console.error(`[shipping] catalog variant lookup failed for sync_variant_id=${syncVarId} (${item.pid}/${item.size}/${item.color || ''}):`, e.message);
+      const label = item.name || `${item.pid}${item.size ? ` ${item.size}` : ''}${item.color ? ` ${item.color}` : ''}`;
+      throw new Error(`Unable to look up shipping for "${label}". Please remove this item or try again in a moment.`);
+    }
+    pfItems.push({ quantity: item.qty || 1, variant_id: catalogVarId });
+  }
   if (pfItems.length === 0) return [];
 
   const body     = { recipient, items: pfItems, currency: 'USD', locale: 'en_US' };
@@ -909,10 +967,7 @@ async function getProductionCost(syncVariantId, pfHeaders) {
   const cached = productionCostCache.get(syncVariantId);
   if (cached && Date.now() < cached.expiresAt) return cached.cost;
 
-  const svRes  = await fetch(`https://api.printful.com/store/variants/${syncVariantId}`, { headers: pfHeaders });
-  const svData = await svRes.json();
-  if (!svRes.ok) throw new Error(`store/variants/${syncVariantId}: ${svData.error?.message}`);
-  const catalogVarId = svData.result.variant_id;
+  const catalogVarId = await getCatalogVariantId(syncVariantId, pfHeaders);
 
   const cvRes  = await fetch(`https://api.printful.com/products/variant/${catalogVarId}`, { headers: pfHeaders });
   const cvData = await cvRes.json();
