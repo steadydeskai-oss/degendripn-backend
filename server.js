@@ -1391,6 +1391,79 @@ app.post('/api/admin/cleanup-ghost-orders', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /api/admin/validate-variants — check every env-configured sync variant ID against Printful
+app.get('/api/admin/validate-variants', requireAdmin, async (req, res) => {
+  const pfHeaders = {
+    Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
+  };
+
+  // Collect every { productKey, variantKey, variantId } entry from both maps
+  const entries = [];
+
+  for (const [productKey, fn] of Object.entries(REPRESENTATIVE_SYNC_VARIANTS)) {
+    const id = fn();
+    entries.push({ productKey, variantKey: '(representative)', variantId: id || null, envMissing: !id });
+  }
+
+  const variantMap = buildVariantMap();
+  for (const [productKey, sizeColorMap] of Object.entries(variantMap)) {
+    for (const [variantKey, id] of Object.entries(sizeColorMap)) {
+      entries.push({ productKey, variantKey, variantId: id || null, envMissing: !id });
+    }
+  }
+
+  // Deduplicate by variantId so we only hit Printful once per ID
+  const seen    = new Map(); // variantId → result
+  const results = [];
+
+  await Promise.all(entries.map(async entry => {
+    const { productKey, variantKey, variantId, envMissing } = entry;
+
+    if (envMissing) {
+      results.push({ productKey, variantKey, variantId: null, valid: false, error: 'env var not set' });
+      return;
+    }
+
+    if (seen.has(variantId)) {
+      const cached = seen.get(variantId);
+      results.push({ productKey, variantKey, variantId, ...cached });
+      return;
+    }
+
+    try {
+      const pfRes  = await fetch(`https://api.printful.com/sync/variant/${variantId}`, { headers: pfHeaders });
+      const pfData = await pfRes.json();
+      if (pfRes.ok) {
+        const sv   = pfData.result?.sync_variant;
+        const info = { valid: true, productName: sv?.name || null, status: sv?.availability_status || null, error: null };
+        seen.set(variantId, info);
+        results.push({ productKey, variantKey, variantId, ...info });
+      } else {
+        const info = { valid: false, productName: null, status: null, error: pfData.error?.message || `HTTP ${pfRes.status}` };
+        seen.set(variantId, info);
+        results.push({ productKey, variantKey, variantId, ...info });
+      }
+    } catch (e) {
+      const info = { valid: false, productName: null, status: null, error: e.message };
+      seen.set(variantId, info);
+      results.push({ productKey, variantKey, variantId, ...info });
+    }
+  }));
+
+  results.sort((a, b) => a.productKey.localeCompare(b.productKey) || a.variantKey.localeCompare(b.variantKey));
+
+  const summary = {
+    total:   results.length,
+    valid:   results.filter(r => r.valid).length,
+    invalid: results.filter(r => !r.valid).length,
+    envMissing: results.filter(r => r.error === 'env var not set').length,
+  };
+
+  console.log(`[validate-variants] ${summary.valid}/${summary.total} valid, ${summary.invalid} invalid, ${summary.envMissing} env missing`);
+  res.json({ summary, results });
+});
+
 // ─── PRINTFUL SHIPPING WEBHOOK ────────────────────────────────────────────────
 // Configure in Printful dashboard → Settings → Webhooks → package_shipped
 // URL: https://degendripn-backend-production.up.railway.app/api/printful-webhook
