@@ -927,6 +927,40 @@ app.post('/api/mockup', async (req, res) => {
   }
 });
 
+// ─── PRINTFUL OUTAGE DETECTION ───────────────────────────────────────────────
+// Distinguishes a Printful service outage (network failure, timeout, 5xx) from
+// a normal API error (4xx like "invalid variant", "destination unsupported").
+// Outages must block checkout — we can't confirm shipping cost or take payment
+// when Printful is unreachable. Normal API errors fall through to existing
+// per-endpoint handling (CONUS-fallback-to-free, 422 for unsupported, etc.).
+class PrintfulOutageError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'PrintfulOutageError';
+    if (cause) this.cause = cause;
+  }
+}
+
+async function fetchPrintful(url, opts = {}, timeoutMs = 8000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res;
+  try {
+    res = await fetch(url, { ...opts, signal: ctrl.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') {
+      throw new PrintfulOutageError(`Printful request timed out after ${timeoutMs}ms: ${url}`, e);
+    }
+    throw new PrintfulOutageError(`Printful network error (${url}): ${e.message}`, e);
+  }
+  clearTimeout(timer);
+  if (res.status >= 500) {
+    throw new PrintfulOutageError(`Printful returned HTTP ${res.status} for ${url}`);
+  }
+  return res;
+}
+
 // ─── SHIPPING HELPERS ────────────────────────────────────────────────────────
 // US states/territories/military codes that do NOT get free shipping. Includes
 // Alaska, Hawaii, the territories (PR/GU/VI/AS/MP/UM), and APO/FPO/DPO military
@@ -975,7 +1009,7 @@ async function getCatalogVariantId(syncVariantId, pfHeaders) {
     }
   }
 
-  const res  = await fetch(`https://api.printful.com/store/variants/${sid}`, { headers: pfHeaders });
+  const res  = await fetchPrintful(`https://api.printful.com/store/variants/${sid}`, { headers: pfHeaders });
   const data = await res.json();
   if (!res.ok) {
     throw new Error(`Printful store/variants/${sid} lookup failed: ${data.error?.message || `HTTP ${res.status}`}`);
@@ -1030,7 +1064,7 @@ async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
   }
 
   console.log('[shipping] → POST /shipping/rates body:', JSON.stringify(body));
-  const res  = await fetch('https://api.printful.com/shipping/rates', {
+  const res  = await fetchPrintful('https://api.printful.com/shipping/rates', {
     method:  'POST',
     headers: { ...pfHeaders, 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
@@ -1057,7 +1091,7 @@ async function getProductionCost(syncVariantId, pfHeaders) {
 
   const catalogVarId = await getCatalogVariantId(syncVariantId, pfHeaders);
 
-  const cvRes  = await fetch(`https://api.printful.com/products/variant/${catalogVarId}`, { headers: pfHeaders });
+  const cvRes  = await fetchPrintful(`https://api.printful.com/products/variant/${catalogVarId}`, { headers: pfHeaders });
   const cvData = await cvRes.json();
   if (!cvRes.ok) throw new Error(`products/variant/${catalogVarId}: ${cvData.error?.message}`);
   const cost = parseFloat(cvData.result.variant.price);
@@ -1108,8 +1142,17 @@ app.post('/api/shipping-rates', shippingRatesLimiter, async (req, res) => {
     }
     res.json({ isFree: cost === 0, cost, label: cost === 0 ? 'Free' : best.name });
   } catch (err) {
+    if (err instanceof PrintfulOutageError) {
+      // Printful is down — block checkout instead of guessing a rate.
+      console.error('[shipping-rates] Printful OUTAGE — returning 503:', err.message);
+      return res.status(503).json({
+        error:   'shipping_unavailable',
+        message: "We can't calculate shipping right now. Please try again in a few minutes.",
+      });
+    }
     if (conus) {
-      // Printful API hiccup shouldn't block CONUS checkout — fall back to free.
+      // Non-outage Printful error (e.g. variant lookup quirk) — keep the
+      // existing CONUS-fallback-to-free behavior since the API itself is up.
       console.warn('[shipping-rates] CONUS Printful lookup failed — defaulting to free:', err.message);
       return res.json({ isFree: true, cost: 0, label: 'Free' });
     }
@@ -1170,6 +1213,13 @@ app.post('/api/checkout', checkoutLimiter, async (req, res) => {
         shippingCost        = conus ? conusCustomerShipping(rawPrintfulShipping) : rawPrintfulShipping;
       }
     } catch (e) {
+      if (e instanceof PrintfulOutageError) {
+        console.error('[checkout] Printful OUTAGE — refusing to create Stripe session:', e.message);
+        return res.status(503).json({
+          error:   'shipping_unavailable',
+          message: "We can't confirm shipping right now. Please try again in a few minutes.",
+        });
+      }
       console.warn('[checkout] Could not fetch shipping rate:', e.message);
       rawPrintfulShipping = conus ? CONUS_SUBSIDY : 12;
       shippingCost        = conus ? 0 : rawPrintfulShipping;
@@ -1185,6 +1235,13 @@ app.post('/api/checkout', checkoutLimiter, async (req, res) => {
           const cost = await getProductionCost(syncVarId, pfHeaders);
           totalProductionCost += cost * (item.qty || 1);
         } catch (e) {
+          if (e instanceof PrintfulOutageError) {
+            console.error('[checkout] Printful OUTAGE during production cost lookup — refusing to create Stripe session:', e.message);
+            return res.status(503).json({
+              error:   'shipping_unavailable',
+              message: "We can't confirm shipping right now. Please try again in a few minutes.",
+            });
+          }
           console.warn(`[checkout] Could not get production cost for ${item.pid}/${item.size}:`, e.message);
         }
       }
