@@ -856,7 +856,10 @@ app.post('/api/mockup', async (req, res) => {
 });
 
 // ─── SHIPPING HELPERS ────────────────────────────────────────────────────────
-const NON_CONUS = new Set(['AK','HI','PR','GU','VI','AS','MP','UM']);
+// US states/territories/military codes that do NOT get free shipping. Includes
+// Alaska, Hawaii, the territories (PR/GU/VI/AS/MP/UM), and APO/FPO/DPO military
+// addresses (AA/AE/AP). Free shipping is the continental 48 states only.
+const NON_CONUS = new Set(['AK','HI','PR','GU','VI','AS','MP','UM','AA','AE','AP']);
 
 function isCONUS(country, state) {
   return country === 'US' && !NON_CONUS.has((state || '').toUpperCase().trim());
@@ -964,11 +967,6 @@ function cheapestRate(rates) {
   return rates.reduce((a, b) => parseFloat(a.rate) <= parseFloat(b.rate) ? a : b, rates[0]);
 }
 
-const SHIPPING_BASELINE = 5.00;
-function customerShippingCost(printfulRate) {
-  return Math.max(0, parseFloat(printfulRate) - SHIPPING_BASELINE);
-}
-
 // ─── PRODUCTION COST LOOKUP ──────────────────────────────────────────────────
 const productionCostCache = new Map();
 
@@ -1018,9 +1016,9 @@ app.post('/api/shipping-rates', async (req, res) => {
     }
     console.log(`[shipping-rates] Printful returned ${rates.length} rate option(s):`, JSON.stringify(rates.map(r => ({ id: r.id, name: r.name, rate: r.rate, currency: r.currency }))));
     const best = cheapestRate(rates);
-    const cost = customerShippingCost(best.rate);
-    console.log(`[shipping-rates] cheapest=${best.name} printfulRate=$${best.rate} baseline=$${SHIPPING_BASELINE} → customerCost=$${cost.toFixed(2)} (isFree=${cost === 0})`);
-    res.json({ isFree: cost === 0, cost, label: best.name });
+    const cost = parseFloat(best.rate);
+    console.log(`[shipping-rates] cheapest=${best.name} printfulRate=$${best.rate} → customerCost=$${cost.toFixed(2)} (no subsidy outside continental US)`);
+    res.json({ isFree: false, cost, label: best.name });
   } catch (err) {
     console.error('[shipping-rates] error:', err.message);
     res.status(500).json({ error: err.message });
@@ -1068,6 +1066,7 @@ app.post('/api/checkout', async (req, res) => {
       zip:          shipping.zip   || '',
     };
 
+    const conus = isCONUS(shipping.country, shipping.state);
     let rawPrintfulShipping = 0, shippingLabel = 'Free shipping', shippingCost = 0;
     try {
       const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
@@ -1075,14 +1074,12 @@ app.post('/api/checkout', async (req, res) => {
         const best          = cheapestRate(rates);
         rawPrintfulShipping = parseFloat(best.rate);
         shippingLabel       = best.name;
-        shippingCost        = isCONUS(shipping.country, shipping.state)
-          ? 0
-          : customerShippingCost(rawPrintfulShipping);
+        shippingCost        = conus ? 0 : rawPrintfulShipping;
       }
     } catch (e) {
       console.warn('[checkout] Could not fetch shipping rate:', e.message);
-      rawPrintfulShipping = isCONUS(shipping.country, shipping.state) ? 5 : 12;
-      shippingCost        = isCONUS(shipping.country, shipping.state) ? 0 : Math.max(0, rawPrintfulShipping - SHIPPING_BASELINE);
+      rawPrintfulShipping = conus ? 5 : 12;
+      shippingCost        = conus ? 0 : rawPrintfulShipping;
       shippingLabel       = 'Shipping & handling';
     }
 
