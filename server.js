@@ -916,7 +916,10 @@ async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
   const pfItems = [];
   for (const item of cartItems) {
     const syncVarId = getVariantId(item.pid, item.size, item.color);
-    if (!syncVarId) continue;
+    if (!syncVarId) {
+      console.warn(`[shipping] no sync variant for ${item.pid}/${item.size}/${item.color || ''} — skipping`);
+      continue;
+    }
     let catalogVarId;
     try {
       catalogVarId = await getCatalogVariantId(syncVarId, pfHeaders);
@@ -925,25 +928,31 @@ async function getPrintfulShippingRates(recipient, cartItems, pfHeaders) {
       const label = item.name || `${item.pid}${item.size ? ` ${item.size}` : ''}${item.color ? ` ${item.color}` : ''}`;
       throw new Error(`Unable to look up shipping for "${label}". Please remove this item or try again in a moment.`);
     }
+    console.log(`[shipping] resolved sync ${syncVarId} → catalog ${catalogVarId} (${item.pid}/${item.size}/${item.color || ''} x${item.qty || 1})`);
     pfItems.push({ quantity: item.qty || 1, variant_id: catalogVarId });
   }
-  if (pfItems.length === 0) return [];
+  if (pfItems.length === 0) {
+    console.warn('[shipping] no resolvable items in cart — returning empty rate list');
+    return [];
+  }
 
   const body     = { recipient, items: pfItems, currency: 'USD', locale: 'en_US' };
   const cacheKey = JSON.stringify(body);
   const cached   = shippingRateCache.get(cacheKey);
   if (cached && Date.now() < cached.expiresAt) {
-    console.log('[shipping] cache hit');
+    const ttlSec = Math.round((cached.expiresAt - Date.now()) / 1000);
+    console.log(`[shipping] in-memory cache hit (ttl ${ttlSec}s) — rates:`, JSON.stringify(cached.rates));
     return cached.rates;
   }
 
+  console.log('[shipping] → POST /shipping/rates body:', JSON.stringify(body));
   const res  = await fetch('https://api.printful.com/shipping/rates', {
     method:  'POST',
     headers: { ...pfHeaders, 'Content-Type': 'application/json' },
     body:    JSON.stringify(body),
   });
   const data = await res.json();
-  console.log('[shipping] Printful /shipping/rates HTTP', res.status, JSON.stringify(data).slice(0, 300));
+  console.log(`[shipping] ← Printful HTTP ${res.status} raw response:`, JSON.stringify(data));
   if (!res.ok) throw new Error(data.error?.message || JSON.stringify(data));
 
   const rates = data.result || [];
@@ -983,7 +992,10 @@ app.post('/api/shipping-rates', async (req, res) => {
   const { cart, shipping } = req.body;
   if (!cart || !shipping) return res.status(400).json({ error: 'Missing cart or shipping' });
 
+  console.log(`[shipping-rates] request: country=${shipping.country} state=${shipping.state || ''} zip=${shipping.zip || ''} cart=`, JSON.stringify((cart || []).map(i => ({ pid: i.pid, size: i.size, color: i.color, qty: i.qty }))));
+
   if (isCONUS(shipping.country, shipping.state)) {
+    console.log('[shipping-rates] CONUS — returning free shipping without calling Printful');
     return res.json({ isFree: true, cost: 0, label: 'Free' });
   }
 
@@ -1001,13 +1013,16 @@ app.post('/api/shipping-rates', async (req, res) => {
   try {
     const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
     if (!rates.length) {
+      console.warn('[shipping-rates] Printful returned 0 rates — destination unsupported');
       return res.status(422).json({ error: 'Printful does not ship to this destination.' });
     }
+    console.log(`[shipping-rates] Printful returned ${rates.length} rate option(s):`, JSON.stringify(rates.map(r => ({ id: r.id, name: r.name, rate: r.rate, currency: r.currency }))));
     const best = cheapestRate(rates);
     const cost = customerShippingCost(best.rate);
+    console.log(`[shipping-rates] cheapest=${best.name} printfulRate=$${best.rate} baseline=$${SHIPPING_BASELINE} → customerCost=$${cost.toFixed(2)} (isFree=${cost === 0})`);
     res.json({ isFree: cost === 0, cost, label: best.name });
   } catch (err) {
-    console.error('[shipping-rates]', err.message);
+    console.error('[shipping-rates] error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1673,6 +1688,57 @@ async function registerPrintfulWebhook() {
   }
 }
 
+// ─── SHIPPING CACHE INSPECTION ────────────────────────────────────────────────
+// Shipping rates are cached in-process only (shippingRateCache Map, 5-min TTL),
+// not in Redis. This scans Redis for any leftover shipping/rate keys from prior
+// experiments so we can confirm nothing stale is bleeding through.
+async function scanShippingCacheKeys() {
+  const result = {
+    inMemory: {
+      size: shippingRateCache.size,
+      ttlMs: 5 * 60 * 1000,
+      entries: Array.from(shippingRateCache.entries()).map(([key, val]) => ({
+        key:        key.length > 200 ? key.slice(0, 200) + '…' : key,
+        ratesCount: Array.isArray(val.rates) ? val.rates.length : 0,
+        rates:      val.rates,
+        expiresIn:  Math.max(0, Math.round((val.expiresAt - Date.now()) / 1000)),
+      })),
+    },
+    redis: { available: !!redis, keys: [] },
+  };
+  if (!redis) return result;
+
+  const patterns = ['shipping*', 'shipping:*', 'rate*', 'rates*', 'ship:*', 'pf:shipping*'];
+  const seen = new Set();
+  try {
+    for (const pattern of patterns) {
+      let cursor = '0';
+      do {
+        const [next, batch] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
+        cursor = next;
+        for (const k of batch) {
+          if (seen.has(k)) continue;
+          seen.add(k);
+          const ttl = await redis.ttl(k);
+          result.redis.keys.push({ key: k, ttl });
+        }
+      } while (cursor !== '0');
+    }
+  } catch (e) {
+    result.redis.error = e.message;
+  }
+  return result;
+}
+
+app.get('/api/admin/debug/shipping-cache', requireAdmin, async (req, res) => {
+  try {
+    const data = await scanShippingCacheKeys();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── START ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 DegenDrip backend  http://localhost:${PORT}`);
@@ -1687,4 +1753,19 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   Mockup:         POST /api/mockup`);
   console.log(`   Mockup cache: ${mockupCache.size} entries\n`);
   registerPrintfulWebhook().catch(e => console.error('[printful-webhook] Startup registration threw:', e.message));
+
+  scanShippingCacheKeys()
+    .then(snap => {
+      console.log(`[shipping-cache] in-memory entries: ${snap.inMemory.size}`);
+      if (!snap.redis.available) {
+        console.log('[shipping-cache] Redis: not configured');
+      } else if (snap.redis.error) {
+        console.log('[shipping-cache] Redis scan error:', snap.redis.error);
+      } else if (snap.redis.keys.length === 0) {
+        console.log('[shipping-cache] Redis: 0 shipping/rate keys found (no stale cache)');
+      } else {
+        console.log(`[shipping-cache] Redis: ${snap.redis.keys.length} shipping/rate keys:`, JSON.stringify(snap.redis.keys));
+      }
+    })
+    .catch(e => console.error('[shipping-cache] startup scan failed:', e.message));
 });
