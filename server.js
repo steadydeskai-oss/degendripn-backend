@@ -1270,6 +1270,10 @@ async function handleCompletedSession(session) {
 
   await reviewOrderSave(reviewOrder);
   if (orderId) await orderStoreDel(orderId);
+  if (redis) {
+    redis.setex(`ro:session:${session.id}`, REVIEW_ORDER_TTL, reviewOrderId)
+      .catch(e => console.warn('[webhook] failed to index ro:session:', e.message));
+  }
   console.log(`[webhook] Order saved for review: ${reviewOrderId} — ${shipping.email}${reviewFlags.length ? ` — ${reviewFlags.length} flag(s)` : ''}`);
 
   sendOrderReceived(reviewOrder).catch(e => console.error('[email]', e.message));
@@ -1288,6 +1292,30 @@ async function handleCompletedSession(session) {
       </div>`),
   }).catch(e => console.error('[email admin]', e.message));
 }
+
+// GET /api/order-id/:sessionId — public lookup so the success page can show the
+// review-order ID (ro_xxx) after the Stripe redirect. Resolves session_id → orderId.
+app.get('/api/order-id/:sessionId', async (req, res) => {
+  const sessionId = String(req.params.sessionId || '');
+  if (!sessionId.startsWith('cs_')) return res.status(400).json({ error: 'invalid session id' });
+  let orderId = null;
+  if (redis) {
+    try { orderId = await redis.get(`ro:session:${sessionId}`); } catch (e) {
+      console.warn('[order-id] Redis read error:', e.message);
+    }
+  }
+  if (!orderId) {
+    try {
+      const all = await reviewOrderList();
+      const found = all.find(o => o.stripeSessionId === sessionId);
+      if (found) orderId = found.orderId;
+    } catch (e) {
+      console.warn('[order-id] reviewOrderList scan error:', e.message);
+    }
+  }
+  if (!orderId) return res.status(404).json({ error: 'not found' });
+  res.json({ orderId });
+});
 
 // ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
 
