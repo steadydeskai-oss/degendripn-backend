@@ -1534,6 +1534,168 @@ app.get('/api/admin/validate-variants', requireAdmin, async (req, res) => {
   res.json({ summary, results });
 });
 
+// GET /api/admin/variant-costs — diagnostic: pull Printful cost + retail + US/intl shipping for every configured sync variant
+app.get('/api/admin/variant-costs', requireAdmin, async (req, res) => {
+  const pfHeaders = {
+    Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
+    'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
+  };
+
+  const usRecipient = {
+    address1:     '1529 Rapids Road',
+    city:         'Portland',
+    state_code:   'TN',
+    country_code: 'US',
+    zip:          '37148',
+  };
+  const intlRecipient = {
+    address1:     '10 Downing Street',
+    city:         'London',
+    state_code:   '',
+    country_code: 'GB',
+    zip:          'SW1A 2AA',
+  };
+
+  const entries = [];
+  for (const [productKey, fn] of Object.entries(REPRESENTATIVE_SYNC_VARIANTS)) {
+    const id = fn();
+    if (id) entries.push({ productKey, variantKey: '(representative)', syncVariantId: String(id) });
+  }
+  const vmap = buildVariantMap();
+  for (const [productKey, sizeColorMap] of Object.entries(vmap)) {
+    for (const [variantKey, id] of Object.entries(sizeColorMap)) {
+      if (id) entries.push({ productKey, variantKey, syncVariantId: String(id) });
+    }
+  }
+
+  async function quoteShipping(catalogVariantId, recipient) {
+    try {
+      const body = {
+        recipient,
+        items:    [{ quantity: 1, variant_id: catalogVariantId }],
+        currency: 'USD',
+        locale:   'en_US',
+      };
+      const r = await fetch('https://api.printful.com/shipping/rates', {
+        method:  'POST',
+        headers: { ...pfHeaders, 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) return { rate: null, currency: null, label: null, error: d.error?.message || `HTTP ${r.status}` };
+      const rates = d.result || [];
+      if (!rates.length) return { rate: null, currency: null, label: null, error: 'no rates' };
+      const c = rates.reduce((a, b) => parseFloat(a.rate) <= parseFloat(b.rate) ? a : b, rates[0]);
+      return { rate: parseFloat(c.rate), currency: c.currency, label: c.name, error: null };
+    } catch (e) {
+      return { rate: null, currency: null, label: null, error: e.message };
+    }
+  }
+
+  const uniqueIds  = Array.from(new Set(entries.map(e => e.syncVariantId)));
+  const perVariant = new Map();
+  const CONCURRENCY = 3;
+
+  let cursor = 0;
+  async function worker() {
+    while (cursor < uniqueIds.length) {
+      const idx = cursor++;
+      const sid = uniqueIds[idx];
+      const out = {
+        catalogVariantId: null, productName: null, printfulCost: null, retailPrice: null, currency: null,
+        usShippingCost: null, usShippingLabel: null, usShippingError: null,
+        internationalShippingCost: null, internationalShippingLabel: null, internationalShippingError: null,
+        error: null,
+      };
+      try {
+        const svRes  = await fetch(`https://api.printful.com/store/variants/${sid}`, { headers: pfHeaders });
+        const svData = await svRes.json();
+        if (!svRes.ok) {
+          out.error = `store/variants: ${svData.error?.message || `HTTP ${svRes.status}`}`;
+          perVariant.set(sid, out);
+          continue;
+        }
+        const r = svData.result || {};
+        out.catalogVariantId = r.variant_id || null;
+        out.productName      = r.product?.name || r.name || null;
+        out.retailPrice      = r.retail_price ? parseFloat(r.retail_price) : null;
+        out.currency         = r.currency || 'USD';
+
+        if (out.catalogVariantId) {
+          const [cv, us, intl] = await Promise.all([
+            (async () => {
+              try {
+                const r2 = await fetch(`https://api.printful.com/products/variant/${out.catalogVariantId}`, { headers: pfHeaders });
+                const d2 = await r2.json();
+                if (!r2.ok) return { cost: null, error: d2.error?.message || `HTTP ${r2.status}` };
+                const price = parseFloat(d2.result?.variant?.price);
+                return { cost: Number.isFinite(price) ? price : null, error: null };
+              } catch (e) {
+                return { cost: null, error: e.message };
+              }
+            })(),
+            quoteShipping(out.catalogVariantId, usRecipient),
+            quoteShipping(out.catalogVariantId, intlRecipient),
+          ]);
+          out.printfulCost                = cv.cost;
+          if (cv.error) out.error = (out.error ? out.error + '; ' : '') + `products/variant: ${cv.error}`;
+          out.usShippingCost              = us.rate;
+          out.usShippingLabel             = us.label;
+          out.usShippingError             = us.error;
+          out.internationalShippingCost   = intl.rate;
+          out.internationalShippingLabel  = intl.label;
+          out.internationalShippingError  = intl.error;
+        } else {
+          out.error = (out.error ? out.error + '; ' : '') + 'no catalog variant_id';
+        }
+      } catch (e) {
+        out.error = e.message;
+      }
+      perVariant.set(sid, out);
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  const results = entries.map(({ productKey, variantKey, syncVariantId }) => {
+    const v = perVariant.get(syncVariantId) || {};
+    return {
+      productKey,
+      variantKey,
+      syncVariantId:               parseInt(syncVariantId),
+      catalogVariantId:            v.catalogVariantId            ?? null,
+      productName:                 v.productName                 ?? null,
+      printfulCost:                v.printfulCost                ?? null,
+      retailPrice:                 v.retailPrice                 ?? null,
+      usShippingCost:              v.usShippingCost              ?? null,
+      usShippingLabel:             v.usShippingLabel             ?? null,
+      usShippingError:             v.usShippingError             ?? null,
+      internationalShippingCost:   v.internationalShippingCost   ?? null,
+      internationalShippingLabel:  v.internationalShippingLabel  ?? null,
+      internationalShippingError:  v.internationalShippingError  ?? null,
+      currency:                    v.currency                    ?? 'USD',
+      error:                       v.error                       ?? null,
+    };
+  });
+
+  const uniques   = Array.from(perVariant.values());
+  const avg       = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+  const costs     = uniques.map(v => v.printfulCost).filter(Number.isFinite);
+  const usRates   = uniques.map(v => v.usShippingCost).filter(Number.isFinite);
+  const intlRates = uniques.map(v => v.internationalShippingCost).filter(Number.isFinite);
+  const summary = {
+    totalRows:                        results.length,
+    uniqueVariants:                   uniques.length,
+    averagePrintfulCost:              avg(costs),
+    averageUsShippingCost:            avg(usRates),
+    averageInternationalShippingCost: avg(intlRates),
+    currency:                         'USD',
+    sampleAddresses:                  { us: usRecipient, international: intlRecipient },
+  };
+
+  console.log(`[variant-costs] ${results.length} rows / ${uniques.length} unique variants — avg cost $${(summary.averagePrintfulCost ?? 0).toFixed(2)}, avg US ship $${(summary.averageUsShippingCost ?? 0).toFixed(2)}, avg intl ship $${(summary.averageInternationalShippingCost ?? 0).toFixed(2)}`);
+  res.json({ summary, results });
+});
+
 // ─── PRINTFUL SHIPPING WEBHOOK ────────────────────────────────────────────────
 // Configure in Printful dashboard → Settings → Webhooks → package_shipped
 // URL: https://degendripn-backend-production.up.railway.app/api/printful-webhook
