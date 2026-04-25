@@ -941,7 +941,7 @@ function isCONUS(country, state) {
 // passed through to the customer. Intended to keep small/light orders shipping
 // "free" while not eating unbounded cost on bulk carts where Printful's rate
 // climbs past $5.
-const CONUS_SUBSIDY = 5;
+const CONUS_SUBSIDY = 8;
 function conusCustomerShipping(printfulRate) {
   return Math.max(0, parseFloat(printfulRate) - CONUS_SUBSIDY);
 }
