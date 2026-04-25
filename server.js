@@ -540,6 +540,11 @@ const shippingRatesLimiter = rateLimitMiddleware(
   'Too many shipping rate requests. Please wait a moment and try again.',
   [{ kind: 'ip', max: 30, windowSeconds: 5 * 60 }]
 );
+const orderStatusLimiter = rateLimitMiddleware(
+  'order-status',
+  'Too many lookups. Please wait a few minutes and try again.',
+  [{ kind: 'ip', max: 30, windowSeconds: 5 * 60 }]
+);
 
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.resolve(__dirname, '../DegenDrip_v14.html')));
@@ -1382,6 +1387,50 @@ app.get('/api/order-id/:sessionId', async (req, res) => {
   }
   if (!orderId) return res.status(404).json({ error: 'not found' });
   res.json({ orderId });
+});
+
+// POST /api/order-status — customer-facing order lookup. Returns public-safe
+// fields only (no design URLs, payment intent IDs, address, name, or
+// moderation flags). Generic 404 message regardless of whether the order
+// exists with a different email so we don't leak account existence.
+app.post('/api/order-status', orderStatusLimiter, async (req, res) => {
+  const orderId = String(req.body?.orderId || '').trim();
+  const email   = String(req.body?.email   || '').toLowerCase().trim();
+  const NOT_FOUND = { error: "Order not found, or email doesn't match. Please check your details and try again." };
+
+  if (!orderId || !email) return res.status(400).json({ error: 'Order ID and email are required.' });
+  if (!orderId.startsWith('ro_')) return res.status(404).json(NOT_FOUND);
+
+  try {
+    const order = await reviewOrderGet(orderId);
+    if (!order) return res.status(404).json(NOT_FOUND);
+    if (String(order.customerEmail || '').toLowerCase().trim() !== email) {
+      return res.status(404).json(NOT_FOUND);
+    }
+    const items = (order.items || []).map(i => ({
+      name:  i.name  || null,
+      size:  i.size  || null,
+      color: i.color || null,
+      qty:   i.qty   || 1,
+      price: typeof i.price === 'number' ? i.price : null,
+    }));
+    res.json({
+      orderId:         order.orderId,
+      status:          order.status,
+      items,
+      total:           typeof order.total === 'number' ? order.total : null,
+      shippingCost:    typeof order.shippingCost === 'number' ? order.shippingCost : null,
+      currency:        'USD',
+      createdAt:       order.createdAt  || null,
+      reviewedAt:      order.reviewedAt || null,
+      rejectionReason: order.status === 'rejected' ? (order.rejectionReason || null) : null,
+      trackingUrl:     order.status === 'shipped'  ? (order.trackingUrl || null) : null,
+      carrier:         order.status === 'shipped'  ? (order.carrier || null) : null,
+    });
+  } catch (e) {
+    console.error('[order-status] error:', e.message);
+    res.status(500).json({ error: 'Lookup failed. Please try again.' });
+  }
 });
 
 // ─── ADMIN ENDPOINTS ──────────────────────────────────────────────────────────
