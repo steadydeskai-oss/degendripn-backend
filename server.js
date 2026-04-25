@@ -937,6 +937,15 @@ function isCONUS(country, state) {
   return country === 'US' && !NON_CONUS.has((state || '').toUpperCase().trim());
 }
 
+// Lower-48 US: we absorb the first $5 of Printful shipping. Anything beyond is
+// passed through to the customer. Intended to keep small/light orders shipping
+// "free" while not eating unbounded cost on bulk carts where Printful's rate
+// climbs past $5.
+const CONUS_SUBSIDY = 5;
+function conusCustomerShipping(printfulRate) {
+  return Math.max(0, parseFloat(printfulRate) - CONUS_SUBSIDY);
+}
+
 const shippingRateCache = new Map();
 
 // Maps a Printful sync_variant_id (per-store) → catalog variant_id (Printful catalog).
@@ -1064,11 +1073,7 @@ app.post('/api/shipping-rates', shippingRatesLimiter, async (req, res) => {
 
   console.log(`[shipping-rates] request: country=${shipping.country} state=${shipping.state || ''} zip=${shipping.zip || ''} cart=`, JSON.stringify((cart || []).map(i => ({ pid: i.pid, size: i.size, color: i.color, qty: i.qty }))));
 
-  if (isCONUS(shipping.country, shipping.state)) {
-    console.log('[shipping-rates] CONUS — returning free shipping without calling Printful');
-    return res.json({ isFree: true, cost: 0, label: 'Free' });
-  }
-
+  const conus = isCONUS(shipping.country, shipping.state);
   const pfHeaders = {
     Authorization:   `Bearer ${process.env.PRINTFUL_API_KEY}`,
     'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID || '',
@@ -1083,15 +1088,31 @@ app.post('/api/shipping-rates', shippingRatesLimiter, async (req, res) => {
   try {
     const rates = await getPrintfulShippingRates(recipient, cart, pfHeaders);
     if (!rates.length) {
+      if (conus) {
+        // CONUS shouldn't return zero options under normal conditions; default
+        // to free so checkout isn't blocked.
+        console.warn('[shipping-rates] CONUS Printful returned 0 rates — defaulting to free');
+        return res.json({ isFree: true, cost: 0, label: 'Free' });
+      }
       console.warn('[shipping-rates] Printful returned 0 rates — destination unsupported');
       return res.status(422).json({ error: 'Printful does not ship to this destination.' });
     }
     console.log(`[shipping-rates] Printful returned ${rates.length} rate option(s):`, JSON.stringify(rates.map(r => ({ id: r.id, name: r.name, rate: r.rate, currency: r.currency }))));
-    const best = cheapestRate(rates);
-    const cost = parseFloat(best.rate);
-    console.log(`[shipping-rates] cheapest=${best.name} printfulRate=$${best.rate} → customerCost=$${cost.toFixed(2)} (no subsidy outside continental US)`);
-    res.json({ isFree: false, cost, label: best.name });
+    const best         = cheapestRate(rates);
+    const printfulCost = parseFloat(best.rate);
+    const cost         = conus ? conusCustomerShipping(printfulCost) : printfulCost;
+    if (conus) {
+      console.log(`[shipping-rates] CONUS cheapest=${best.name} printfulRate=$${printfulCost.toFixed(2)} − $${CONUS_SUBSIDY} subsidy → customerCost=$${cost.toFixed(2)}`);
+    } else {
+      console.log(`[shipping-rates] cheapest=${best.name} printfulRate=$${printfulCost.toFixed(2)} → customerCost=$${cost.toFixed(2)} (no subsidy outside continental US)`);
+    }
+    res.json({ isFree: cost === 0, cost, label: cost === 0 ? 'Free' : best.name });
   } catch (err) {
+    if (conus) {
+      // Printful API hiccup shouldn't block CONUS checkout — fall back to free.
+      console.warn('[shipping-rates] CONUS Printful lookup failed — defaulting to free:', err.message);
+      return res.json({ isFree: true, cost: 0, label: 'Free' });
+    }
     console.error('[shipping-rates] error:', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -1146,11 +1167,11 @@ app.post('/api/checkout', checkoutLimiter, async (req, res) => {
         const best          = cheapestRate(rates);
         rawPrintfulShipping = parseFloat(best.rate);
         shippingLabel       = best.name;
-        shippingCost        = conus ? 0 : rawPrintfulShipping;
+        shippingCost        = conus ? conusCustomerShipping(rawPrintfulShipping) : rawPrintfulShipping;
       }
     } catch (e) {
       console.warn('[checkout] Could not fetch shipping rate:', e.message);
-      rawPrintfulShipping = conus ? 5 : 12;
+      rawPrintfulShipping = conus ? CONUS_SUBSIDY : 12;
       shippingCost        = conus ? 0 : rawPrintfulShipping;
       shippingLabel       = 'Shipping & handling';
     }
