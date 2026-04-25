@@ -474,6 +474,73 @@ app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
 
+// Railway sits behind a proxy; trust X-Forwarded-* so req.ip is the real client.
+app.set('trust proxy', true);
+
+// ─── RATE LIMITING ───────────────────────────────────────────────────────────
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || req.ip || req.connection?.remoteAddress || 'unknown';
+}
+
+// Returns true if the request is allowed, false if it should be blocked.
+// Counts incrementally in Redis with a windowed TTL. Fails open if Redis is down
+// — better to let traffic through than to wedge the site on a Redis hiccup.
+async function rateLimit(key, max, windowSeconds) {
+  if (!redis) return true;
+  try {
+    const fullKey = `ratelimit:${key}`;
+    const count = await redis.incr(fullKey);
+    if (count === 1) await redis.expire(fullKey, windowSeconds);
+    return count <= max;
+  } catch (e) {
+    console.warn('[ratelimit] Redis error, failing open:', e.message);
+    return true;
+  }
+}
+
+// limits: [{ kind: 'ip' | 'email', max, windowSeconds }]
+function rateLimitMiddleware(name, message, limits) {
+  return async function (req, res, next) {
+    const ip = clientIp(req);
+    for (const lim of limits) {
+      let identifier = null;
+      if (lim.kind === 'ip') {
+        identifier = ip;
+      } else if (lim.kind === 'email') {
+        identifier = String(req.body?.shipping?.email || req.body?.email || '').toLowerCase().trim();
+        if (!identifier) continue; // no email in this request — only the IP limit applies
+      }
+      const key = `${name}:${lim.kind}:${identifier}:${lim.windowSeconds}`;
+      const allowed = await rateLimit(key, lim.max, lim.windowSeconds);
+      if (!allowed) {
+        console.warn(`[ratelimit] BLOCKED endpoint=${name} ${lim.kind}=${identifier} ip=${ip} limit=${lim.max}/${lim.windowSeconds}s`);
+        return res.status(429).json({ error: message });
+      }
+    }
+    next();
+  };
+}
+
+const checkoutLimiter = rateLimitMiddleware(
+  'checkout',
+  'Too many checkout attempts. Please wait a few minutes and try again.',
+  [
+    { kind: 'ip',    max: 5,  windowSeconds: 15 * 60 },
+    { kind: 'email', max: 10, windowSeconds: 60 * 60 },
+  ]
+);
+const uploadDesignLimiter = rateLimitMiddleware(
+  'upload-design',
+  'Upload limit reached. Please wait.',
+  [{ kind: 'ip', max: 30, windowSeconds: 60 * 60 }]
+);
+const shippingRatesLimiter = rateLimitMiddleware(
+  'shipping-rates',
+  'Too many shipping rate requests. Please wait a moment and try again.',
+  [{ kind: 'ip', max: 30, windowSeconds: 5 * 60 }]
+);
+
 // ─── Frontend ─────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.sendFile(path.resolve(__dirname, '../DegenDrip_v14.html')));
 
@@ -691,7 +758,7 @@ app.get('/api/tmp/:uuid', (req, res) => {
   res.send(entry.buffer);
 });
 
-app.post('/api/upload-design', async (req, res) => {
+app.post('/api/upload-design', uploadDesignLimiter, async (req, res) => {
   const { base64 } = req.body;
   if (!base64) return res.status(400).json({ error: 'Missing base64' });
 
@@ -986,7 +1053,7 @@ async function getProductionCost(syncVariantId, pfHeaders) {
 }
 
 // ─── SHIPPING RATES ENDPOINT ─────────────────────────────────────────────────
-app.post('/api/shipping-rates', async (req, res) => {
+app.post('/api/shipping-rates', shippingRatesLimiter, async (req, res) => {
   const { cart, shipping } = req.body;
   if (!cart || !shipping) return res.status(400).json({ error: 'Missing cart or shipping' });
 
@@ -1026,7 +1093,7 @@ app.post('/api/shipping-rates', async (req, res) => {
 });
 
 // ─── STRIPE CHECKOUT ──────────────────────────────────────────────────────────
-app.post('/api/checkout', async (req, res) => {
+app.post('/api/checkout', checkoutLimiter, async (req, res) => {
   const { cart, shipping, tokenName, tokenSym } = req.body;
   if (!cart || cart.length === 0) return res.status(400).json({ error: 'Empty cart' });
 
