@@ -1245,6 +1245,34 @@ app.get('/api/admin/orders/:orderId', requireAdmin, async (req, res) => {
   }
 });
 
+// ─── Shared refund-and-reject helper ─────────────────────────────────────────
+async function refundAndReject(orderId, reason) {
+  const order = await reviewOrderGet(orderId);
+  if (!order) throw new Error('Order not found');
+
+  if (order.stripePaymentIntentId) {
+    try {
+      await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
+      console.log(`[admin] Refunded PI ${order.stripePaymentIntentId}`);
+    } catch (stripeErr) {
+      const alreadyRefunded = stripeErr.code === 'charge_already_refunded'
+        || /already been refunded/i.test(stripeErr.message || '');
+      if (alreadyRefunded) {
+        console.warn(`[admin] PI ${order.stripePaymentIntentId} already refunded — treating as success`);
+      } else {
+        throw stripeErr;
+      }
+    }
+  }
+
+  const updated = await reviewOrderUpdate(orderId, {
+    status:          'rejected',
+    reviewedAt:      new Date().toISOString(),
+    rejectionReason: reason,
+  });
+  return updated;
+}
+
 // POST /api/admin/orders/:orderId/approve → Printful → in_production → email customer
 app.post('/api/admin/orders/:orderId/approve', requireAdmin, async (req, res) => {
   try {
@@ -1252,14 +1280,52 @@ app.post('/api/admin/orders/:orderId/approve', requireAdmin, async (req, res) =>
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (order.status !== 'pending_review') return res.status(409).json({ error: `Order is already ${order.status}` });
 
-    const pfResult       = await createPrintfulOrder({
-      cart:            order.items,
-      shipping:        order.shippingAddress,
-      tokenName:       order.tokenName,
-      tokenSym:        order.tokenSym,
-      shippingCost:    order.shippingCost || 0,
-      stripeSessionId: order.stripeSessionId,
-    });
+    let pfResult;
+    try {
+      pfResult = await createPrintfulOrder({
+        cart:            order.items,
+        shipping:        order.shippingAddress,
+        tokenName:       order.tokenName,
+        tokenSym:        order.tokenSym,
+        shippingCost:    order.shippingCost || 0,
+        stripeSessionId: order.stripeSessionId,
+      });
+    } catch (pfErr) {
+      // Printful rejected — auto-refund and notify
+      const pfMsg   = pfErr.message || 'Unknown error';
+      const reason  = `Auto-refunded: Print partner rejected this design. Reason: ${pfMsg}`;
+      console.error(`[admin] Printful rejected order ${order.orderId} — auto-refunding. ${pfMsg}`);
+
+      let updated;
+      try {
+        updated = await refundAndReject(req.params.orderId, reason);
+      } catch (refundErr) {
+        console.error('[admin] Auto-refund after Printful rejection failed:', refundErr.message);
+        return res.status(500).json({ error: `Printful rejected the order and auto-refund failed: ${refundErr.message}` });
+      }
+
+      sendOrderRejected(updated).catch(e => console.error('[email]', e.message));
+      sendEmail({
+        to:      ADMIN_EMAIL,
+        subject: `⚠ Printful auto-rejected order ${order.orderId}`,
+        html:    emailWrap(`
+          <h2 style="font-size:18px;color:#ffaaaa;margin:0 0 12px">Printful rejected an order</h2>
+          <p style="color:#aaa;margin:0 0 16px">Order <strong style="color:#fff">${escHtml(order.orderId)}</strong> was rejected by Printful at submission. The customer has been <strong style="color:#fff">auto-refunded</strong>.</p>
+          <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px;margin-bottom:12px">
+            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Printful error</div>
+            <div style="color:#ffaaaa;font-size:13px">${escHtml(pfMsg)}</div>
+          </div>
+          <div style="background:#1a1a24;border:1px solid #2a2a3a;border-radius:8px;padding:16px">
+            <div style="font-size:11px;color:#666;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Customer</div>
+            <div style="color:#ddd;font-size:13px">${escHtml(order.customerEmail)}</div>
+          </div>`),
+      }).catch(e => console.error('[email admin pf-reject]', e.message));
+
+      return res.status(422).json({
+        error: `Printful rejected this order — customer has been auto-refunded. Reason: ${pfMsg}`,
+      });
+    }
+
     const printfulOrderId = pfResult?.result?.id || null;
 
     // Store Printful→review mapping so the shipping webhook can find this order
@@ -1290,28 +1356,8 @@ app.post('/api/admin/orders/:orderId/reject', requireAdmin, async (req, res) => 
     if (!order) return res.status(404).json({ error: 'Order not found' });
     if (order.status !== 'pending_review') return res.status(409).json({ error: `Order is already ${order.status}` });
 
-    const reason = (req.body.reason || '').trim() || 'Order could not be fulfilled';
-
-    if (order.stripePaymentIntentId) {
-      try {
-        await stripe.refunds.create({ payment_intent: order.stripePaymentIntentId });
-        console.log(`[admin] Refunded PI ${order.stripePaymentIntentId}`);
-      } catch (stripeErr) {
-        const alreadyRefunded = stripeErr.code === 'charge_already_refunded'
-          || /already been refunded/i.test(stripeErr.message || '');
-        if (alreadyRefunded) {
-          console.warn(`[admin] PI ${order.stripePaymentIntentId} already refunded — treating as success`);
-        } else {
-          throw stripeErr;
-        }
-      }
-    }
-
-    const updated = await reviewOrderUpdate(req.params.orderId, {
-      status:          'rejected',
-      reviewedAt:      new Date().toISOString(),
-      rejectionReason: reason,
-    });
+    const reason  = (req.body.reason || '').trim() || 'Order could not be fulfilled';
+    const updated = await refundAndReject(req.params.orderId, reason);
 
     console.log(`[admin] REJECTED ${order.orderId} — "${reason}"`);
     sendOrderRejected(updated).catch(e => console.error('[email]', e.message));
