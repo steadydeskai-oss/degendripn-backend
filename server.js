@@ -1443,6 +1443,31 @@ async function handleCompletedSession(session) {
   }).catch(e => console.error('[email admin]', e.message));
 }
 
+// GET /api/verify-session/:sessionId — proves a Stripe Checkout session was
+// real and paid. The success view on the frontend gates rendering on this so
+// a forged URL like /?order=success can't fake an "Order Confirmed!" screen.
+// Returns 200 { verified: true } only when status=complete AND payment_status
+// is paid (or no_payment_required for $0 sessions). Anything else → 404.
+app.get('/api/verify-session/:sessionId', orderStatusLimiter, async (req, res) => {
+  const sessionId = String(req.params.sessionId || '');
+  if (!/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)) {
+    return res.status(400).json({ verified: false, error: 'invalid session id' });
+  }
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const paid     = session.payment_status === 'paid' || session.payment_status === 'no_payment_required';
+    const complete = session.status === 'complete';
+    if (paid && complete) return res.json({ verified: true });
+    return res.status(404).json({
+      verified: false,
+      reason:   `payment_status=${session.payment_status} status=${session.status}`,
+    });
+  } catch (e) {
+    console.warn('[verify-session] Stripe lookup failed:', e.message);
+    return res.status(404).json({ verified: false, error: 'not found' });
+  }
+});
+
 // GET /api/order-id/:sessionId — public lookup so the success page can show the
 // review-order ID (ro_xxx) after the Stripe redirect. Resolves session_id → orderId.
 app.get('/api/order-id/:sessionId', async (req, res) => {
